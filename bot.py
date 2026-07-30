@@ -27,6 +27,11 @@ GENERAL_CHANNELS: Dict[int, str] = {
     int(os.getenv("ENGLISH_CHANNEL_ID", "0")): "en",
     int(os.getenv("SPANISH_CHANNEL_ID", "0")): "es",
     int(os.getenv("PORTUGUESE_CHANNEL_ID", "0")): "pt",
+    int(os.getenv("FRENCH_CHANNEL_ID", "0")): "fr",
+    int(os.getenv("GERMAN_CHANNEL_ID", "0")): "de",
+    int(os.getenv("TURKISH_CHANNEL_ID", "0")): "tr",
+    int(os.getenv("ARABIC_CHANNEL_ID", "0")): "ar",
+    int(os.getenv("CHINESE_CHANNEL_ID", "0")): "zh-CN",
 }
 GENERAL_CHANNELS = {
     channel_id: language
@@ -50,6 +55,11 @@ LANGUAGE_NAMES = {
     "en": "English",
     "es": "Spanish (Latin America)",
     "pt": "Portuguese",
+    "fr": "French",
+    "de": "German",
+    "tr": "Turkish",
+    "ar": "Arabic",
+    "zh-CN": "Chinese (Simplified)",
 }
 
 # These game words will be protected from translation.
