@@ -815,7 +815,7 @@ def validate_settings():
     if not TOKEN:
         missing.append("DISCORD_BOT_TOKEN")
     if not GENERAL_CHANNELS:
-    missing.append("general channel IDs")
+        missing.append("general channel IDs")
 
     if missing:
         print("\nSETUP IS INCOMPLETE")
