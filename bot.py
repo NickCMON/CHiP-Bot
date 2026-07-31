@@ -334,7 +334,21 @@ async def fetch_linked_message(
 ENGLISH_ROLE_ID = 1529497300903395580
 SPANISH_ROLE_ID = 1529497832266928189
 PORTUGUESE_ROLE_ID = 1529498212476653649
-LANGUAGE_ROLE_IDS = {ENGLISH_ROLE_ID, SPANISH_ROLE_ID, PORTUGUESE_ROLE_ID}
+FRENCH_ROLE_ID = 1532391441148547245
+GERMAN_ROLE_ID = 1532392352721932428
+TURKISH_ROLE_ID = 1532392461291487232
+ARABIC_ROLE_ID = 1532392586658971678
+CHINESE_ROLE_ID = 1532392671266607164
+LANGUAGE_ROLE_IDS = {
+    ENGLISH_ROLE_ID,
+    SPANISH_ROLE_ID,
+    PORTUGUESE_ROLE_ID,
+    FRENCH_ROLE_ID,
+    GERMAN_ROLE_ID,
+    TURKISH_ROLE_ID,
+    ARABIC_ROLE_ID,
+    CHINESE_ROLE_ID
+}
 
 
 async def set_language_role(interaction: discord.Interaction, role_id: int, language_name: str):
@@ -397,7 +411,7 @@ class LanguageView(discord.ui.View):
 
     @discord.ui.button(
         label="Español",
-        emoji="🇪🇸",
+         emoji="🇪🇸",
         style=discord.ButtonStyle.primary,
         custom_id="cmon_language_spanish",
     )
@@ -413,7 +427,93 @@ class LanguageView(discord.ui.View):
     async def portuguese_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await set_language_role(interaction, PORTUGUESE_ROLE_ID, "Português")
 
+    @discord.ui.button(
+        label="Français",
+        emoji="🇫🇷",
+        style=discord.ButtonStyle.primary,
+        custom_id="cmon_language_french",
+   )
+    async def french_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_language_role(interaction, FRENCH_ROLE_ID, "Français")
 
+    @discord.ui.button(
+        label="Deutsch",
+        emoji="🇩🇪",
+        style=discord.ButtonStyle.primary,
+        custom_id="cmon_language_german",
+   )
+    async def german_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_language_role(interaction, GERMAN_ROLE_ID, "Deutsch")
+
+
+    @discord.ui.button(
+        label="Türkçe",
+        emoji="🇹🇷",
+        style=discord.ButtonStyle.primary,
+        custom_id="cmon_language_turkish",
+   )
+    async def turkish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_language_role(interaction, TURKISH_ROLE_ID, "Türkçe")
+
+
+    @discord.ui.button(
+        label="العربية",
+        emoji="🇸🇦",
+        style=discord.ButtonStyle.primary,
+        custom_id="cmon_language_arabic",
+   )
+    async def arabic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_language_role(interaction, ARABIC_ROLE_ID, "العربية")
+
+
+    @discord.ui.button(
+        label="中文",
+        emoji="🇨🇳",
+        style=discord.ButtonStyle.primary,
+        custom_id="cmon_language_chinese",
+   )
+    async def chinese_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_language_role(interaction, CHINESE_ROLE_ID, "中文")
+
+
+    @discord.ui.button(
+        label="Clear All Languages",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="cmon_language_clear",
+   )
+    async def clear_languages_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+
+        roles_to_remove = [
+            ENGLISH_ROLE_ID,
+            SPANISH_ROLE_ID,
+            PORTUGUESE_ROLE_ID,
+            FRENCH_ROLE_ID,
+            GERMAN_ROLE_ID,
+            TURKISH_ROLE_ID,
+            ARABIC_ROLE_ID,
+            CHINESE_ROLE_ID,
+        ]
+
+        removed = []
+
+        for role_id in roles_to_remove:
+            role = interaction.guild.get_role(role_id)
+            if role and role in member.roles:
+                await member.remove_roles(role)
+                removed.append(role.name)
+
+        if removed:
+            await interaction.response.send_message(
+                "🗑️ All language roles have been removed.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "You don't currently have any language roles.",
+                 ephemeral=True,
+            )
 
 def protect_terms(text: str):
     protected = {}
@@ -534,15 +634,22 @@ async def on_ready():
 @bot.command(name="languagepanel")
 @commands.has_permissions(administrator=True)
 async def language_panel(ctx: commands.Context):
-    message = (
-        "🌍 **Choose Your Language**\n\n"
-        "Welcome to CMON! Choose your preferred language below. "
-        "You can change it at any time by clicking a different button.\n\n"
-        "🇺🇸 English\n"
-        "🇪🇸 Español\n"
-        "🇵🇹 Português"
-    )
-    await ctx.send(message, view=LanguageView())
+        message = (
+            "🌍 **Choose Your Language**\n\n"
+            "Welcome to CMON! Choose one or more languages below.\n"
+            "You can select multiple languages and change them at any time.\n\n"
+            "🇺🇸 English\n"
+            "🇪🇸 Español\n"
+            "🇵🇹 Português\n"
+            "🇫🇷 Français\n"
+            "🇩🇪 Deutsch\n"
+            "🇹🇷 Türkçe\n"
+            "🇸🇦 العربية\n"
+            "🇨🇳 中文\n\n"
+            "🗑️ Clear All Languages"
+        )
+        
+        await ctx.send(message, view=LanguageView())
 
 
 @language_panel.error
