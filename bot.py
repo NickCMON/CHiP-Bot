@@ -515,6 +515,189 @@ class LanguageView(discord.ui.View):
                  ephemeral=True,
             )
 
+
+# Cosmetic cookie color roles. These roles should have no permissions enabled.
+RED_VELVET_ROLE_ID = 1536150463429222471
+COTTON_CANDY_ROLE_ID = 1536153800648302653
+STRAWBERRY_CHEESECAKE_ROLE_ID = 1536158096752115794
+LEMON_CRINKLE_ROLE_ID = 1536167299017347103
+BLUEBERRY_MUFFIN_ROLE_ID = 1536169060251869284
+CHOCOLATE_MINT_ROLE_ID = 1536169257610641408
+MATCHA_ROLE_ID = 1536169515841360012
+OATMEAL_RAISIN_ROLE_ID = 1536169728194908301
+CARAMEL_PROTEIN_ROLE_ID = 1536169774180999168
+PEANUT_BUTTER_ROLE_ID = 1536170400579457144
+WHITE_CHOCOLATE_MACADAMIA_ROLE_ID = 1536170954202415236
+OREO_ROLE_ID = 1536508913057533992
+CHOCOLATE_CHIP_ROLE_ID = 1536509835439378462
+VANILLA_BEAN_ROLE_ID = 1536510082769231902
+
+COOKIE_COLOR_ROLE_IDS = {
+    RED_VELVET_ROLE_ID,
+    COTTON_CANDY_ROLE_ID,
+    STRAWBERRY_CHEESECAKE_ROLE_ID,
+    LEMON_CRINKLE_ROLE_ID,
+    BLUEBERRY_MUFFIN_ROLE_ID,
+    CHOCOLATE_MINT_ROLE_ID,
+    MATCHA_ROLE_ID,
+    OATMEAL_RAISIN_ROLE_ID,
+    CARAMEL_PROTEIN_ROLE_ID,
+    PEANUT_BUTTER_ROLE_ID,
+    WHITE_CHOCOLATE_MACADAMIA_ROLE_ID,
+    OREO_ROLE_ID,
+    CHOCOLATE_CHIP_ROLE_ID,
+    VANILLA_BEAN_ROLE_ID,
+}
+
+
+async def set_cookie_color_role(
+    interaction: discord.Interaction,
+    role_id: int,
+    cookie_name: str,
+):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This button can only be used inside the CMON server.",
+            ephemeral=True,
+        )
+        return
+
+    selected_role = interaction.guild.get_role(role_id)
+    if selected_role is None:
+        await interaction.response.send_message(
+            "I could not find that cookie role. Please tell an administrator.",
+            ephemeral=True,
+        )
+        return
+
+    roles_to_remove = [
+        role
+        for role in interaction.user.roles
+        if role.id in COOKIE_COLOR_ROLE_IDS and role.id != role_id
+    ]
+
+    try:
+        if roles_to_remove:
+            await interaction.user.remove_roles(
+                *roles_to_remove,
+                reason="Member changed cosmetic cookie color",
+            )
+
+        if selected_role not in interaction.user.roles:
+            await interaction.user.add_roles(
+                selected_role,
+                reason=f"Member selected {cookie_name}",
+            )
+
+        await interaction.response.send_message(
+            f"🍪 Your cookie color is now **{cookie_name}**!",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot assign that role. Make sure CHiP's bot role is above all cookie color roles and has Manage Roles enabled.",
+            ephemeral=True,
+        )
+
+
+async def clear_cookie_color_role(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This button can only be used inside the CMON server.",
+            ephemeral=True,
+        )
+        return
+
+    roles_to_remove = [
+        role for role in interaction.user.roles if role.id in COOKIE_COLOR_ROLE_IDS
+    ]
+
+    try:
+        if roles_to_remove:
+            await interaction.user.remove_roles(
+                *roles_to_remove,
+                reason="Member returned to default Cookie color",
+            )
+            await interaction.response.send_message(
+                "🍪 Your cosmetic cookie color was removed. You're back to the default Cookie color.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "You're already using the default Cookie color.",
+                ephemeral=True,
+            )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot remove that role. Make sure CHiP's bot role is above all cookie color roles and has Manage Roles enabled.",
+            ephemeral=True,
+        )
+
+
+class CookieColorView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Red Velvet", emoji="❤️", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_red_velvet", row=0)
+    async def red_velvet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, RED_VELVET_ROLE_ID, "Red Velvet Cookie")
+
+    @discord.ui.button(label="Cotton Candy", emoji="🍬", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_cotton_candy", row=0)
+    async def cotton_candy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, COTTON_CANDY_ROLE_ID, "Cotton Candy Cookie")
+
+    @discord.ui.button(label="Strawberry Cheesecake", emoji="🍓", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_strawberry_cheesecake", row=0)
+    async def strawberry_cheesecake(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, STRAWBERRY_CHEESECAKE_ROLE_ID, "Strawberry Cheesecake Cookie")
+
+    @discord.ui.button(label="Lemon Crinkle", emoji="🍋", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_lemon_crinkle", row=1)
+    async def lemon_crinkle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, LEMON_CRINKLE_ROLE_ID, "Lemon Crinkle Cookie")
+
+    @discord.ui.button(label="Blueberry Muffin", emoji="🫐", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_blueberry_muffin", row=1)
+    async def blueberry_muffin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, BLUEBERRY_MUFFIN_ROLE_ID, "Blueberry Muffin Cookie")
+
+    @discord.ui.button(label="Chocolate Mint", emoji="🌿", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_chocolate_mint", row=1)
+    async def chocolate_mint(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, CHOCOLATE_MINT_ROLE_ID, "Chocolate Mint Cookie")
+
+    @discord.ui.button(label="Matcha", emoji="🍵", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_matcha", row=2)
+    async def matcha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, MATCHA_ROLE_ID, "Matcha Cookie")
+
+    @discord.ui.button(label="Oatmeal Raisin", emoji="🍇", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_oatmeal_raisin", row=2)
+    async def oatmeal_raisin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, OATMEAL_RAISIN_ROLE_ID, "Oatmeal Raisin Cookie")
+
+    @discord.ui.button(label="Caramel Protein", emoji="💪", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_caramel_protein", row=2)
+    async def caramel_protein(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, CARAMEL_PROTEIN_ROLE_ID, "Caramel Protein Cookie")
+
+    @discord.ui.button(label="Peanut Butter", emoji="🥜", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_peanut_butter", row=3)
+    async def peanut_butter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, PEANUT_BUTTER_ROLE_ID, "Peanut Butter Cookie")
+
+    @discord.ui.button(label="White Choco Macadamia", emoji="🤍", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_white_choco_macadamia", row=3)
+    async def white_choco_macadamia(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, WHITE_CHOCOLATE_MACADAMIA_ROLE_ID, "White Chocolate Macadamia Cookie")
+
+    @discord.ui.button(label="Oreo", emoji="⚫", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_oreo", row=3)
+    async def oreo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, OREO_ROLE_ID, "Oreo Cookie")
+
+    @discord.ui.button(label="Chocolate Chip", emoji="🍫", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_chocolate_chip", row=4)
+    async def chocolate_chip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, CHOCOLATE_CHIP_ROLE_ID, "Chocolate Chip Cookie")
+
+    @discord.ui.button(label="Vanilla Bean", emoji="🤍", style=discord.ButtonStyle.secondary, custom_id="cmon_cookie_vanilla_bean", row=4)
+    async def vanilla_bean(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await set_cookie_color_role(interaction, VANILLA_BEAN_ROLE_ID, "Vanilla Bean Cookie")
+
+    @discord.ui.button(label="Default Cookie", emoji="🍪", style=discord.ButtonStyle.danger, custom_id="cmon_cookie_default", row=4)
+    async def default_cookie(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await clear_cookie_color_role(interaction)
+
 def protect_terms(text: str):
     protected = {}
     result = text
@@ -624,6 +807,10 @@ async def on_ready():
         bot.add_view(LanguageView())
         bot.language_view_added = True
 
+    if not getattr(bot, "cookie_color_view_added", False):
+        bot.add_view(CookieColorView())
+        bot.cookie_color_view_added = True
+
     log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     log.info("Configured translation groups: %s", TRANSLATION_GROUPS)
     print("\nCOOKIE TRANSLATOR IS ONLINE")
@@ -660,6 +847,64 @@ async def language_panel_error(ctx: commands.Context, error):
         raise error
 
 
+@bot.command(name="cookiepanel")
+@commands.has_permissions(administrator=True)
+async def cookie_panel(ctx: commands.Context):
+    message = (
+        "🍪 **Choose Your Cookie Color!**\n\n"
+        "Pick your favorite cookie below to customize your name color in CMON.\n"
+        "These roles are cosmetic only and do **not** change your permissions or channel access.\n"
+        "Choosing a new cookie automatically replaces your previous cookie color.\n\n"
+        "❤️ Red Velvet • 🍬 Cotton Candy • 🍓 Strawberry Cheesecake\n"
+        "🍋 Lemon Crinkle • 🫐 Blueberry Muffin • 🌿 Chocolate Mint\n"
+        "🍵 Matcha • 🍇 Oatmeal Raisin • 💪 Caramel Protein\n"
+        "🥜 Peanut Butter • 🤍 White Chocolate Macadamia • ⚫ Oreo\n"
+        "🍫 Chocolate Chip • 🤍 Vanilla Bean\n\n"
+        "🍪 **Default Cookie** removes your cosmetic color and returns you to the normal Cookie role color."
+    )
+    await ctx.send(message, view=CookieColorView())
+
+
+@cookie_panel.error
+async def cookie_panel_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Only a server administrator can post the cookie color panel.")
+    else:
+        raise error
+
+@bot.command(name="cookieupdate")
+@commands.has_permissions(administrator=True)
+async def cookie_update(ctx: commands.Context):
+    message = (
+        "@everyone\n\n"
+        "🍪 **CMON COOKIE UPDATE!** 🍪\n\n"
+        "New cookie colors are officially live!\n\n"
+        "Head over to **#choose-your-cookie-flavor** and pick your favorite "
+        "cookie to customize your name color.\n\n"
+        "❤️ Red Velvet • 🍬 Cotton Candy • 🍓 Strawberry Cheesecake\n"
+        "🍋 Lemon Crinkle • 🫐 Blueberry Muffin • 🌿 Chocolate Mint\n"
+        "🍵 Matcha • 🍇 Oatmeal Raisin • 💪 Caramel Protein\n"
+        "🥜 Peanut Butter • 🤍 White Chocolate Macadamia • ⚫ Oreo\n"
+        "🍫 Chocolate Chip • 🤍 Vanilla Bean\n\n"
+        "Your cookie flavor is completely cosmetic and will **not change "
+        "your permissions or server access**. You can change it whenever you want.\n\n"
+        "🍪 **Choose your flavor and show it off!**"
+    )
+
+    await ctx.send(
+        message,
+        allowed_mentions=discord.AllowedMentions(everyone=True)
+    )
+
+
+@cookie_update.error
+async def cookie_update_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            "Only a server administrator can send CMON update announcements."
+        )
+    else:
+        raise error
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id is not None:
