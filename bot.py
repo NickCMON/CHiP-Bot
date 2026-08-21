@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -1206,6 +1207,7 @@ class RelayMedia:
     files: List[RelayFileData] = field(default_factory=list)
     fallback_urls: List[str] = field(default_factory=list)
     all_urls: List[str] = field(default_factory=list)
+    consumed_text_tokens: List[str] = field(default_factory=list)
 
     @property
     def has_media(self) -> bool:
@@ -1229,6 +1231,22 @@ def safe_sticker_filename(name: str, extension: str) -> str:
         for character in name
     ).strip("_")
     return f"{safe_name[:60] or 'sticker'}.{extension}"
+
+
+CUSTOM_EMOJI_PATTERN = re.compile(
+    r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_~]+):(?P<id>\d+)>"
+)
+
+
+def strip_relayed_custom_emojis(text: str, tokens: Sequence[str]) -> str:
+    """Remove custom emoji markup that CHiP re-uploaded as image files."""
+
+    cleaned = text
+    for token in tokens:
+        cleaned = cleaned.replace(token, "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]*\n[ \t]*", "\n", cleaned)
+    return cleaned.strip()
 
 
 async def collect_relay_media(message: discord.Message) -> RelayMedia:
@@ -1305,6 +1323,61 @@ async def collect_relay_media(message: discord.Message) -> RelayMedia:
             discord.HTTPException,
         ):
             log.exception("Could not download sticker %s for relay.", sticker.id)
+            media.fallback_urls.append(url)
+
+    # Webhooks cannot reliably reuse animated or external custom emojis. When
+    # Discord receives markup such as <a:relaxing:123>, it can degrade to the
+    # literal text :relaxing:. Download the emoji from Discord's CDN and
+    # re-upload it as a GIF/PNG so its animation and artwork survive the relay.
+    seen_emoji_ids = set()
+    for match in CUSTOM_EMOJI_PATTERN.finditer(getattr(message, "content", "") or ""):
+        emoji_id = match.group("id")
+        if emoji_id in seen_emoji_ids:
+            continue
+        seen_emoji_ids.add(emoji_id)
+
+        token = match.group(0)
+        animated = bool(match.group("animated"))
+        extension = "gif" if animated else "png"
+        name = match.group("name")
+        url = (
+            f"https://cdn.discordapp.com/emojis/{emoji_id}.{extension}"
+            "?quality=lossless"
+        )
+        media.all_urls.append(url)
+        media.consumed_text_tokens.append(token)
+
+        if len(media.files) >= 10:
+            media.fallback_urls.append(url)
+            continue
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise TranslationError(
+                            f"Discord emoji CDN returned HTTP {response.status}."
+                        )
+                    data = await response.read()
+            if len(data) > upload_limit:
+                media.fallback_urls.append(url)
+                continue
+            media.files.append(
+                RelayFileData(
+                    data=data,
+                    filename=safe_sticker_filename(
+                        f"emoji_{name}_{emoji_id}", extension
+                    ),
+                    description=f"Emoji: {name}",
+                )
+            )
+        except (
+            TranslationError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ):
+            log.exception("Could not download custom emoji %s for relay.", emoji_id)
             media.fallback_urls.append(url)
 
     return media
@@ -1953,8 +2026,11 @@ async def on_message(message: discord.Message):
         return
 
     group_name, group_channels = active_group
-    original_text = message.content.strip()
     media = await collect_relay_media(message)
+    original_text = strip_relayed_custom_emojis(
+        message.content,
+        media.consumed_text_tokens,
+    )
 
     # Media-only messages bypass both translation providers entirely.
     if not original_text and not media.has_media:
@@ -2141,8 +2217,11 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if source_message is None or source_message.author.bot or source_message.webhook_id is not None:
         return
 
-    original_text = source_message.content.strip()
     media = await collect_relay_media(source_message)
+    original_text = strip_relayed_custom_emojis(
+        source_message.content,
+        media.consumed_text_tokens,
+    )
     if not original_text and not media.has_media:
         return
 
