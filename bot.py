@@ -4,16 +4,17 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from chip_translation import (
@@ -23,6 +24,20 @@ from chip_translation import (
     TranslationError,
     protect_text,
     restore_text,
+)
+from chip_contests import (
+    ContestEntryRecord,
+    ContestError,
+    ContestRecord,
+    ContestStateError,
+    ContestStore,
+    ContestTally,
+)
+from chip_chat import (
+    ChatError,
+    ChatHistoryStore,
+    ChatUsage,
+    ChipChatClient,
 )
 
 load_dotenv()
@@ -76,8 +91,25 @@ AZURE_TRANSLATOR_REGION = os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra").strip()
+CHIP_CHAT_MODEL = (
+    os.getenv("CHIP_CHAT_MODEL", "gpt-5.6-luna").strip()
+    or "gpt-5.6-luna"
+)
 TERRA_BUDGET_DEFAULT = max(env_float("TERRA_BUDGET_USD", 4.50), 0.0)
+CHIP_CHAT_CHANNEL_DEFAULT = env_int("CHIP_CHAT_CHANNEL_ID")
+CHIP_CHAT_COOLDOWN_SECONDS = max(
+    env_float("CHIP_CHAT_COOLDOWN_SECONDS", 15.0),
+    5.0,
+)
+CHIP_CHAT_MAX_OUTPUT_TOKENS = max(
+    env_int("CHIP_CHAT_MAX_OUTPUT_TOKENS", 500),
+    64,
+)
+CHIP_CHAT_MAX_PROMPT_CHARACTERS = 1500
 MAX_RELAY_FILE_BYTES = max(env_int("MAX_RELAY_FILE_MB", 20), 1) * 1024 * 1024
+MAX_CONTEST_IMAGE_BYTES = (
+    max(env_int("MAX_CONTEST_IMAGE_MB", 10), 1) * 1024 * 1024
+)
 
 GENERAL_CHANNELS: Dict[int, str] = {
     env_int("ENGLISH_CHANNEL_ID"): "en",
@@ -135,7 +167,11 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 webhook_cache: Dict[int, discord.Webhook] = {}
 database_lock = asyncio.Lock()
-terra_lock = asyncio.Lock()
+ai_budget_lock = asyncio.Lock()
+contest_action_lock = asyncio.Lock()
+chip_chat_cooldowns: Dict[Tuple[int, int], float] = {}
+contest_store = ContestStore(DB_PATH)
+chat_history_store = ChatHistoryStore(DB_PATH)
 
 azure_translator = AzureTranslator(
     key=AZURE_TRANSLATOR_KEY,
@@ -145,6 +181,11 @@ azure_translator = AzureTranslator(
 terra_clarifier = TerraClarifier(
     api_key=OPENAI_API_KEY,
     model=OPENAI_MODEL,
+)
+chip_chat_client = ChipChatClient(
+    api_key=OPENAI_API_KEY,
+    model=CHIP_CHAT_MODEL,
+    max_output_tokens=CHIP_CHAT_MAX_OUTPUT_TOKENS,
 )
 
 
@@ -222,6 +263,8 @@ def _initialize_database_sync() -> None:
             "terra_budget_usd": f"{TERRA_BUDGET_DEFAULT:.6f}",
             "terra_paused": "0",
             "terra_alert_level": "0",
+            "chip_chat_paused": "0",
+            "chip_chat_channel_id": str(CHIP_CHAT_CHANNEL_DEFAULT or 0),
             "maintenance_active": "0",
             "maintenance_started_at": "",
             "maintenance_reason": "",
@@ -238,6 +281,10 @@ def _initialize_database_sync() -> None:
 
 async def initialize_database() -> None:
     await asyncio.to_thread(_initialize_database_sync)
+    await asyncio.gather(
+        contest_store.initialize(),
+        chat_history_store.initialize(),
+    )
 
 
 def _get_setting_sync(setting_key: str, default: str = "") -> str:
@@ -287,6 +334,12 @@ class TerraStatusSnapshot:
     cached_input_tokens: int
     cache_write_tokens: int
     output_tokens: int
+    terra_requests: int
+    terra_messages: int
+    terra_cost_usd: float
+    chat_requests: int
+    chat_messages: int
+    chat_cost_usd: float
 
     @property
     def remaining_usd(self) -> float:
@@ -302,6 +355,8 @@ class TerraStatusSnapshot:
 def _usage_aggregate(
     connection: sqlite3.Connection,
     since: Optional[str] = None,
+    request_kind: Optional[str] = None,
+    exclude_request_kind: Optional[str] = None,
 ) -> Tuple[int, int, int, int, int, int, float]:
     query = """
         SELECT
@@ -314,11 +369,20 @@ def _usage_aggregate(
             COALESCE(SUM(estimated_cost_usd), 0)
         FROM terra_usage
     """
-    parameters: Tuple[str, ...] = ()
+    clauses: List[str] = []
+    parameters: List[str] = []
     if since is not None:
-        query += " WHERE created_at >= ?"
-        parameters = (since,)
-    row = connection.execute(query, parameters).fetchone()
+        clauses.append("created_at >= ?")
+        parameters.append(since)
+    if request_kind is not None:
+        clauses.append("request_kind = ?")
+        parameters.append(request_kind)
+    if exclude_request_kind is not None:
+        clauses.append("request_kind != ?")
+        parameters.append(exclude_request_kind)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    row = connection.execute(query, tuple(parameters)).fetchone()
     return (
         int(row[0]),
         int(row[1]),
@@ -353,6 +417,14 @@ def _get_terra_status_sync() -> TerraStatusSnapshot:
             microsecond=0,
         ).isoformat()
         month = _usage_aggregate(connection, month_start)
+        terra = _usage_aggregate(
+            connection,
+            exclude_request_kind="chip_chat",
+        )
+        chat = _usage_aggregate(
+            connection,
+            request_kind="chip_chat",
+        )
 
     try:
         budget = max(float(settings.get("terra_budget_usd", TERRA_BUDGET_DEFAULT)), 0.0)
@@ -375,6 +447,12 @@ def _get_terra_status_sync() -> TerraStatusSnapshot:
         cached_input_tokens=total[3],
         cache_write_tokens=total[4],
         output_tokens=total[5],
+        terra_requests=terra[0],
+        terra_messages=terra[1],
+        terra_cost_usd=terra[6],
+        chat_requests=chat[0],
+        chat_messages=chat[1],
+        chat_cost_usd=chat[6],
     )
 
 
@@ -383,8 +461,11 @@ async def get_terra_status() -> TerraStatusSnapshot:
         return await asyncio.to_thread(_get_terra_status_sync)
 
 
-def _record_terra_usage_sync(
-    usage: TerraUsage,
+AiUsage = Union[TerraUsage, ChatUsage]
+
+
+def _record_ai_usage_sync(
+    usage: AiUsage,
     source_message_id: int,
     request_kind: str,
 ) -> None:
@@ -418,14 +499,14 @@ def _record_terra_usage_sync(
         connection.commit()
 
 
-async def record_terra_usage(
-    usage: TerraUsage,
+async def record_ai_usage(
+    usage: AiUsage,
     source_message_id: int,
     request_kind: str,
 ) -> None:
     async with database_lock:
         await asyncio.to_thread(
-            _record_terra_usage_sync,
+            _record_ai_usage_sync,
             usage,
             source_message_id,
             request_kind,
@@ -1011,7 +1092,7 @@ class CookieColorView(discord.ui.View):
         await clear_cookie_color_role(interaction)
 
 async def send_admin_notice(message: str) -> None:
-    """Send private Terra alerts to an admin destination, never public chat."""
+    """Send private AI-cost alerts to an admin destination, never public chat."""
 
     if ADMIN_LOG_CHANNEL_ID:
         channel = await get_text_channel(ADMIN_LOG_CHANNEL_ID)
@@ -1046,12 +1127,12 @@ async def send_admin_notice(message: str) -> None:
             await owner.send(message)
             return
         except (discord.Forbidden, discord.HTTPException):
-            log.warning("CHiP could not DM its application owner with a Terra alert.")
+            log.warning("CHiP could not DM its application owner with an AI alert.")
 
     log.warning("ADMIN ALERT | %s", message.replace("\n", " | "))
 
 
-async def check_terra_alerts(
+async def check_ai_budget_alerts(
     status: TerraStatusSnapshot,
     force_cutoff: bool = False,
 ) -> None:
@@ -1066,13 +1147,15 @@ async def check_terra_alerts(
 
     await set_settings({"terra_alert_level": str(reached)})
     cutoff_line = (
-        "\nCHiP has switched Spanish messages to Azure-only fallback."
+        "\nMember chat is unavailable at the cap, and Spanish messages have "
+        "switched to Azure-only fallback."
         if reached >= 100 or force_cutoff
         else ""
     )
     await send_admin_notice(
-        "🍪 **CHiP Terra Budget Alert**\n"
-        f"Usage has reached **{reached}%** of CHiP's local cap.\n"
+        "🍪 **CHiP AI Budget Alert**\n"
+        f"Combined Terra and member-chat usage has reached **{reached}%** of "
+        "CHiP's local cap.\n"
         f"Tracked: **${status.total_cost_usd:.4f}** / "
         f"**${status.budget_usd:.2f}**{cutoff_line}"
     )
@@ -1088,14 +1171,14 @@ async def maybe_clarify_spanish(
     if not terra_clarifier.configured:
         return None
 
-    async with terra_lock:
+    async with ai_budget_lock:
         status = await get_terra_status()
         if status.paused or status.budget_usd <= 0:
             return None
 
         request_ceiling = terra_clarifier.estimate_request_ceiling(protected_text)
         if status.total_cost_usd + request_ceiling > status.budget_usd:
-            await check_terra_alerts(status, force_cutoff=True)
+            await check_ai_budget_alerts(status, force_cutoff=True)
             log.info(
                 "Terra skipped for budget safety: $%.4f tracked of $%.2f cap",
                 status.total_cost_usd,
@@ -1109,10 +1192,130 @@ async def maybe_clarify_spanish(
             log.exception("Terra failed; CHiP is falling back to Azure for this message.")
             return None
 
-        await record_terra_usage(usage, source_message_id, request_kind)
+        await record_ai_usage(usage, source_message_id, request_kind)
         updated_status = await get_terra_status()
-        await check_terra_alerts(updated_status)
+        await check_ai_budget_alerts(updated_status)
         return clarified
+
+
+class ChipChatUnavailable(RuntimeError):
+    """A member-safe reason CHiP chat cannot answer right now."""
+
+
+async def get_chip_chat_channel_id() -> int:
+    raw_value = await get_setting(
+        "chip_chat_channel_id",
+        str(CHIP_CHAT_CHANNEL_DEFAULT or 0),
+    )
+    try:
+        return max(int(raw_value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def strip_chip_mention(text: str, bot_user_id: int) -> str:
+    return re.sub(rf"<@!?{bot_user_id}>", "", text).strip()
+
+
+def split_discord_text(text: str, limit: int = 1850) -> List[str]:
+    """Split a reply without exceeding Discord's 2,000-character limit."""
+
+    remaining = text.strip()
+    if not remaining:
+        return []
+    safe_limit = min(max(limit, 200), 1900)
+    chunks: List[str] = []
+    while len(remaining) > safe_limit:
+        newline_break = remaining.rfind("\n", 0, safe_limit + 1)
+        space_break = remaining.rfind(" ", 0, safe_limit + 1)
+        split_at = max(newline_break, space_break)
+        if split_at < safe_limit // 2:
+            split_at = safe_limit
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def chip_chat_retry_after(
+    guild_id: int,
+    user_id: int,
+    now: Optional[float] = None,
+) -> float:
+    """Register one member request and return remaining cooldown seconds."""
+
+    current = time.monotonic() if now is None else now
+    key = (guild_id, user_id)
+    available_at = chip_chat_cooldowns.get(key, 0.0)
+    if available_at > current:
+        return available_at - current
+    chip_chat_cooldowns[key] = current + CHIP_CHAT_COOLDOWN_SECONDS
+    if len(chip_chat_cooldowns) > 5000:
+        expired = [item for item, expiry in chip_chat_cooldowns.items() if expiry <= current]
+        for item in expired:
+            chip_chat_cooldowns.pop(item, None)
+    return 0.0
+
+
+async def generate_chip_chat_reply(
+    prompt: str,
+    guild_id: int,
+    user_id: int,
+    source_message_id: int,
+) -> str:
+    """Generate one contextual Luna reply inside CHiP's shared AI cap."""
+
+    clean_prompt = prompt.strip()
+    if not chip_chat_client.configured:
+        raise ChipChatUnavailable(
+            "CHiP chat is not configured yet. Please let a server administrator know."
+        )
+    if await get_setting("chip_chat_paused", "0") == "1":
+        raise ChipChatUnavailable("CHiP chat is currently paused by an administrator.")
+
+    history = await chat_history_store.history(guild_id, user_id)
+    async with ai_budget_lock:
+        status = await get_terra_status()
+        if status.budget_usd <= 0 or status.remaining_usd <= 0:
+            await check_ai_budget_alerts(status, force_cutoff=True)
+            raise ChipChatUnavailable(
+                "CHiP chat has reached its shared AI spending limit and is "
+                "temporarily unavailable."
+            )
+
+        request_ceiling = chip_chat_client.estimate_request_ceiling(
+            clean_prompt,
+            history,
+        )
+        if status.total_cost_usd + request_ceiling > status.budget_usd:
+            await check_ai_budget_alerts(status, force_cutoff=True)
+            raise ChipChatUnavailable(
+                "CHiP chat has reached its shared AI spending limit and is "
+                "temporarily unavailable."
+            )
+
+        try:
+            reply, usage = await chip_chat_client.ask(clean_prompt, history)
+        except ChatError as exc:
+            log.exception("CHiP member chat request failed.")
+            raise ChipChatUnavailable(
+                "CHiP had trouble answering just now. Please try again in a moment."
+            ) from exc
+
+        await record_ai_usage(usage, source_message_id, "chip_chat")
+        try:
+            await chat_history_store.append_exchange(
+                guild_id,
+                user_id,
+                clean_prompt,
+                reply,
+            )
+        except (OSError, sqlite3.Error):
+            log.exception("Could not save CHiP member-chat history.")
+        updated_status = await get_terra_status()
+        await check_ai_budget_alerts(updated_status)
+        return reply
 
 
 async def translate_for_targets(
@@ -1207,7 +1410,6 @@ class RelayMedia:
     files: List[RelayFileData] = field(default_factory=list)
     fallback_urls: List[str] = field(default_factory=list)
     all_urls: List[str] = field(default_factory=list)
-    consumed_text_tokens: List[str] = field(default_factory=list)
 
     @property
     def has_media(self) -> bool:
@@ -1231,22 +1433,6 @@ def safe_sticker_filename(name: str, extension: str) -> str:
         for character in name
     ).strip("_")
     return f"{safe_name[:60] or 'sticker'}.{extension}"
-
-
-CUSTOM_EMOJI_PATTERN = re.compile(
-    r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_~]+):(?P<id>\d+)>"
-)
-
-
-def strip_relayed_custom_emojis(text: str, tokens: Sequence[str]) -> str:
-    """Remove custom emoji markup that CHiP re-uploaded as image files."""
-
-    cleaned = text
-    for token in tokens:
-        cleaned = cleaned.replace(token, "")
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"[ \t]*\n[ \t]*", "\n", cleaned)
-    return cleaned.strip()
 
 
 async def collect_relay_media(message: discord.Message) -> RelayMedia:
@@ -1323,61 +1509,6 @@ async def collect_relay_media(message: discord.Message) -> RelayMedia:
             discord.HTTPException,
         ):
             log.exception("Could not download sticker %s for relay.", sticker.id)
-            media.fallback_urls.append(url)
-
-    # Webhooks cannot reliably reuse animated or external custom emojis. When
-    # Discord receives markup such as <a:relaxing:123>, it can degrade to the
-    # literal text :relaxing:. Download the emoji from Discord's CDN and
-    # re-upload it as a GIF/PNG so its animation and artwork survive the relay.
-    seen_emoji_ids = set()
-    for match in CUSTOM_EMOJI_PATTERN.finditer(getattr(message, "content", "") or ""):
-        emoji_id = match.group("id")
-        if emoji_id in seen_emoji_ids:
-            continue
-        seen_emoji_ids.add(emoji_id)
-
-        token = match.group(0)
-        animated = bool(match.group("animated"))
-        extension = "gif" if animated else "png"
-        name = match.group("name")
-        url = (
-            f"https://cdn.discordapp.com/emojis/{emoji_id}.{extension}"
-            "?quality=lossless"
-        )
-        media.all_urls.append(url)
-        media.consumed_text_tokens.append(token)
-
-        if len(media.files) >= 10:
-            media.fallback_urls.append(url)
-            continue
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise TranslationError(
-                            f"Discord emoji CDN returned HTTP {response.status}."
-                        )
-                    data = await response.read()
-            if len(data) > upload_limit:
-                media.fallback_urls.append(url)
-                continue
-            media.files.append(
-                RelayFileData(
-                    data=data,
-                    filename=safe_sticker_filename(
-                        f"emoji_{name}_{emoji_id}", extension
-                    ),
-                    description=f"Emoji: {name}",
-                )
-            )
-        except (
-            TranslationError,
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-        ):
-            log.exception("Could not download custom emoji %s for relay.", emoji_id)
             media.fallback_urls.append(url)
 
     return media
@@ -1464,62 +1595,92 @@ async def edit_webhook_relay(
 
 MAINTENANCE_START_NOTICES = {
     "en": (
-        "🛠️ **CHiP Maintenance Notice**\n"
-        "CHiP is being updated to improve translations and the sharing of "
-        "emojis, stickers, GIFs, and attachments. Translation may be temporarily "
-        "unavailable. We’ll let you know when CHiP is back online!"
+        "🛠️ **CHiP Is Under Maintenance**\n"
+        "CHiP is currently undergoing maintenance for updates or bug fixes. "
+        "Translation and other CHiP services may be temporarily unavailable. "
+        "We’ll notify everyone when CHiP is back online."
     ),
     "es": (
-        "🛠️ **Aviso de mantenimiento de CHiP**\n"
-        "CHiP se está actualizando para mejorar las traducciones y el envío de "
-        "emojis, stickers, GIFs y archivos adjuntos. La traducción puede dejar de "
-        "estar disponible temporalmente. ¡Les avisaremos cuando CHiP vuelva!"
+        "🛠️ **CHiP está en mantenimiento**\n"
+        "CHiP está en mantenimiento por actualizaciones o correcciones de errores. "
+        "Las traducciones y otros servicios de CHiP podrían no estar disponibles "
+        "temporalmente. Avisaremos cuando CHiP vuelva a estar en línea."
     ),
     "pt": (
-        "🛠️ **Aviso de manutenção do CHiP**\n"
-        "O CHiP está sendo atualizado para melhorar as traduções e o envio de "
-        "emojis, stickers, GIFs e anexos. A tradução pode ficar temporariamente "
-        "indisponível. Avisaremos quando o CHiP voltar!"
+        "🛠️ **CHiP está em manutenção**\n"
+        "CHiP está em manutenção para atualizações ou correções de erros. As "
+        "traduções e outros serviços do CHiP podem ficar temporariamente "
+        "indisponíveis. Avisaremos quando o CHiP estiver online novamente."
     ),
     "fr": (
-        "🛠️ **Avis de maintenance de CHiP**\n"
-        "CHiP est en cours de mise à jour afin d’améliorer les traductions et le "
-        "partage des émojis, stickers, GIF et pièces jointes. La traduction peut "
-        "être temporairement indisponible. Nous vous préviendrons dès son retour !"
+        "🛠️ **CHiP est en maintenance**\n"
+        "CHiP est actuellement en maintenance pour des mises à jour ou des "
+        "corrections de bugs. Les traductions et les autres services de CHiP "
+        "peuvent être temporairement indisponibles. Nous vous informerons lorsque "
+        "CHiP sera de nouveau en ligne."
     ),
     "de": (
-        "🛠️ **CHiP-Wartungshinweis**\n"
-        "CHiP wird aktualisiert, um Übersetzungen sowie das Teilen von Emojis, "
-        "Stickern, GIFs und Anhängen zu verbessern. Übersetzungen können "
-        "vorübergehend nicht verfügbar sein. Wir melden uns, sobald CHiP zurück ist!"
+        "🛠️ **CHiP wird gewartet**\n"
+        "CHiP wird derzeit für Updates oder Fehlerbehebungen gewartet. "
+        "Übersetzungen und andere CHiP-Dienste sind möglicherweise vorübergehend "
+        "nicht verfügbar. Wir informieren euch, sobald CHiP wieder online ist."
     ),
     "tr": (
-        "🛠️ **CHiP Bakım Duyurusu**\n"
-        "Çevirileri ve emoji, çıkartma, GIF ile dosya paylaşımını iyileştirmek için "
-        "CHiP güncelleniyor. Çeviri geçici olarak kullanılamayabilir. CHiP tekrar "
-        "çevrimiçi olduğunda size haber vereceğiz!"
+        "🛠️ **CHiP Bakımda**\n"
+        "CHiP şu anda güncellemeler veya hata düzeltmeleri için bakımdadır. Çeviri "
+        "ve diğer CHiP hizmetleri geçici olarak kullanılamayabilir. CHiP tekrar "
+        "çevrimiçi olduğunda herkese haber vereceğiz."
     ),
     "ar": (
-        "🛠️ **إشعار صيانة CHiP**\n"
-        "يتم تحديث CHiP لتحسين الترجمة ومشاركة الرموز التعبيرية والملصقات وصور "
-        "GIF والمرفقات. قد تتوقف الترجمة مؤقتًا. سنخبركم عندما يعود CHiP للعمل!"
+        "🛠️ **CHiP قيد الصيانة**\n"
+        "يخضع CHiP حاليًا للصيانة لإجراء تحديثات أو إصلاح أخطاء. قد لا تتوفر "
+        "الترجمة وخدمات CHiP الأخرى مؤقتًا. سنخبر الجميع عندما يعود CHiP للعمل."
     ),
     "zh-CN": (
-        "🛠️ **CHiP 维护通知**\n"
-        "CHiP 正在更新，以改进翻译以及表情、贴纸、GIF 和附件的转发功能。"
-        "翻译服务可能暂时不可用。CHiP 恢复后我们会通知大家！"
+        "🛠️ **CHiP 正在维护**\n"
+        "CHiP 目前正在进行更新或错误修复。翻译和其他 CHiP 服务可能暂时不可用。"
+        "CHiP 恢复上线后，我们会通知大家。"
     ),
 }
 
 MAINTENANCE_END_NOTICES = {
-    "en": "✅ **CHiP is back online!** Translation and media relay have resumed.",
-    "es": "✅ **¡CHiP volvió a estar en línea!** Las traducciones y el envío de archivos se reanudaron.",
-    "pt": "✅ **O CHiP está online novamente!** As traduções e o envio de arquivos foram retomados.",
-    "fr": "✅ **CHiP est de nouveau en ligne !** Les traductions et le partage de fichiers ont repris.",
-    "de": "✅ **CHiP ist wieder online!** Übersetzungen und die Medienweiterleitung wurden fortgesetzt.",
-    "tr": "✅ **CHiP tekrar çevrimiçi!** Çeviri ve medya aktarımı yeniden başladı.",
-    "ar": "✅ **عاد CHiP للعمل!** تم استئناف الترجمة وإرسال الوسائط.",
-    "zh-CN": "✅ **CHiP 已恢复上线！** 翻译和媒体转发已恢复。",
+    "en": (
+        "✅ **CHiP Is Back Online**\n"
+        "Maintenance is complete. Translation and other CHiP services are "
+        "available again."
+    ),
+    "es": (
+        "✅ **CHiP volvió a estar en línea**\n"
+        "El mantenimiento terminó. Las traducciones y los demás servicios de "
+        "CHiP están disponibles nuevamente."
+    ),
+    "pt": (
+        "✅ **O CHiP está online novamente**\n"
+        "A manutenção foi concluída. As traduções e os outros serviços do CHiP "
+        "estão disponíveis novamente."
+    ),
+    "fr": (
+        "✅ **CHiP est de nouveau en ligne**\n"
+        "La maintenance est terminée. Les traductions et les autres services de "
+        "CHiP sont de nouveau disponibles."
+    ),
+    "de": (
+        "✅ **CHiP ist wieder online**\n"
+        "Die Wartung ist abgeschlossen. Übersetzungen und andere CHiP-Dienste "
+        "sind wieder verfügbar."
+    ),
+    "tr": (
+        "✅ **CHiP Tekrar Çevrimiçi**\n"
+        "Bakım tamamlandı. Çeviri ve diğer CHiP hizmetleri tekrar kullanılabilir."
+    ),
+    "ar": (
+        "✅ **عاد CHiP للعمل**\n"
+        "اكتملت الصيانة. الترجمة وخدمات CHiP الأخرى متاحة مجددًا."
+    ),
+    "zh-CN": (
+        "✅ **CHiP 已恢复上线**\n"
+        "维护已完成。翻译和其他 CHiP 服务现已恢复。"
+    ),
 }
 
 
@@ -1578,6 +1739,818 @@ async def broadcast_language_notice(notices: Dict[str, str]) -> int:
     return sent_count
 
 
+class ContestManagerRequired(app_commands.CheckFailure):
+    """Raised when someone outside the contest team uses a manager command."""
+
+
+class ContestOwnerRequired(app_commands.CheckFailure):
+    """Raised when someone other than the server owner edits contest managers."""
+
+
+def is_contest_owner(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    return interaction.user.id in {
+        interaction.guild.owner_id,
+        OWNER_USER_ID,
+    } - {0}
+
+
+async def contest_manager_predicate(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    if is_contest_owner(interaction):
+        return True
+    if await contest_store.is_manager(interaction.guild.id, interaction.user.id):
+        return True
+    raise ContestManagerRequired()
+
+
+async def contest_owner_predicate(interaction: discord.Interaction) -> bool:
+    if is_contest_owner(interaction):
+        return True
+    raise ContestOwnerRequired()
+
+
+def contest_manager_only():
+    return app_commands.check(contest_manager_predicate)
+
+
+def contest_owner_only():
+    return app_commands.check(contest_owner_predicate)
+
+
+def safe_contest_filename(filename: str, entry_id: int) -> str:
+    original = Path(filename or "entry.png")
+    extension = original.suffix.lower()
+    if extension not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        extension = ".png"
+    safe_stem = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in original.stem
+    ).strip("_")
+    safe_stem = safe_stem[:40] or "cookie_pfp"
+    return f"entry_{entry_id}_{safe_stem}{extension}"
+
+
+def contest_image_is_supported(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    extension = Path(attachment.filename).suffix.lower()
+    return content_type in {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+    } or extension in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def contest_file(entry: ContestEntryRecord) -> discord.File:
+    return discord.File(
+        io.BytesIO(entry.image_data),
+        filename=safe_contest_filename(entry.filename, entry.entry_id),
+    )
+
+
+def contest_entry_embed(
+    contest: ContestRecord,
+    entry: ContestEntryRecord,
+    *,
+    image_url: str,
+    reveal: bool,
+    votes: Optional[int] = None,
+    winner: bool = False,
+) -> discord.Embed:
+    escaped_name = discord.utils.escape_markdown(entry.contestant_name)
+    show_name = reveal or not contest.anonymous
+    title = f"🍪 Entry #{entry.entry_number}"
+    if show_name:
+        title += f" — {escaped_name}"
+
+    if reveal:
+        vote_word = "vote" if votes == 1 else "votes"
+        description = f"**Contestant:** {escaped_name}\n**Votes:** {votes or 0} {vote_word}"
+    else:
+        description = "Click **Vote** below to choose this cookie profile picture."
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.gold() if winner else discord.Color.blurple(),
+    )
+    embed.set_image(url=image_url)
+    if not reveal:
+        embed.set_footer(text="Vote totals stay hidden until the contest closes.")
+    return embed
+
+
+def contest_intro_embed(contest: ContestRecord, closes_at: datetime) -> discord.Embed:
+    closes_timestamp = int(closes_at.timestamp())
+    anonymity_note = (
+        "Contestant names will be revealed after voting closes."
+        if contest.anonymous
+        else "Contestant names are displayed with their entries."
+    )
+    embed = discord.Embed(
+        title=f"🍪 {contest.title}",
+        description=(
+            "Choose your favorite cookie-themed profile picture!\n\n"
+            "• Click the **Vote** button under one entry.\n"
+            "• You receive one vote and may change it before closing.\n"
+            "• Vote totals remain hidden during the contest.\n"
+            f"• {anonymity_note}\n\n"
+            f"**Voting closes:** <t:{closes_timestamp}:F> "
+            f"(<t:{closes_timestamp}:R>)"
+        ),
+        color=discord.Color.from_rgb(181, 101, 29),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="CMON Contest • Powered by CHiP")
+    return embed
+
+
+class ContestVoteView(discord.ui.View):
+    def __init__(self, entry_id: int, *, disabled: bool = False):
+        super().__init__(timeout=None)
+        self.entry_id = entry_id
+        button = discord.ui.Button(
+            label="Vote",
+            emoji="🍪",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"chip_contest_vote:{entry_id}",
+            disabled=disabled,
+        )
+        button.callback = self.record_vote
+        self.add_item(button)
+
+    async def record_vote(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or interaction.user.bot:
+            await interaction.response.send_message(
+                "Only human members inside the CMON server can vote.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            outcome = await contest_store.record_vote(
+                self.entry_id,
+                interaction.user.id,
+            )
+        except ContestError as error:
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
+
+        if outcome.already_selected:
+            message = f"🍪 Entry **#{outcome.entry_number}** is already your vote."
+        elif outcome.previous_entry_number is not None:
+            message = (
+                f"✅ Your vote changed from **#{outcome.previous_entry_number}** "
+                f"to **#{outcome.entry_number}**."
+            )
+        else:
+            message = f"✅ Your vote for **Entry #{outcome.entry_number}** is recorded!"
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+async def restore_contest_vote_views() -> int:
+    restored = 0
+    for entry_id, message_id in await contest_store.open_entry_message_ids():
+        bot.add_view(ContestVoteView(entry_id), message_id=message_id)
+        restored += 1
+    return restored
+
+
+def contest_leaderboard_lines(tallies: Sequence[ContestTally]) -> List[str]:
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for index, tally in enumerate(tallies[:3]):
+        vote_word = "vote" if tally.votes == 1 else "votes"
+        name = discord.utils.escape_markdown(tally.entry.contestant_name)
+        lines.append(
+            f"{medals[index]} **Entry #{tally.entry.entry_number} — {name}** "
+            f"({tally.votes} {vote_word})"
+        )
+    return lines
+
+
+async def reveal_and_disable_contest_entries(
+    contest: ContestRecord,
+    tallies: Sequence[ContestTally],
+) -> None:
+    if not contest.channel_id:
+        return
+    channel = await get_text_channel(contest.channel_id)
+    if channel is None:
+        return
+    highest_votes = max((tally.votes for tally in tallies), default=0)
+    unique_winner = sum(
+        1 for tally in tallies if highest_votes > 0 and tally.votes == highest_votes
+    ) == 1
+
+    for tally in tallies:
+        if not tally.entry.message_id:
+            continue
+        try:
+            message = await channel.fetch_message(tally.entry.message_id)
+            image_url = (
+                message.attachments[0].url
+                if message.attachments
+                else "https://cdn.discordapp.com/embed/avatars/0.png"
+            )
+            await message.edit(
+                embed=contest_entry_embed(
+                    contest,
+                    tally.entry,
+                    image_url=image_url,
+                    reveal=True,
+                    votes=tally.votes,
+                    winner=unique_winner and tally.votes == highest_votes,
+                ),
+                view=ContestVoteView(tally.entry.entry_id, disabled=True),
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            log.exception(
+                "Could not close contest entry message %s.",
+                tally.entry.message_id,
+            )
+
+
+async def announce_contest_results(
+    contest: ContestRecord,
+    tallies: Sequence[ContestTally],
+) -> bool:
+    if not contest.channel_id:
+        return False
+    channel = await get_text_channel(contest.channel_id)
+    if channel is None:
+        return False
+
+    total_votes = sum(tally.votes for tally in tallies)
+    if not tallies or total_votes == 0:
+        embed = discord.Embed(
+            title=f"🍪 {contest.title} — Voting Closed",
+            description="The contest closed without any votes.",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        try:
+            message = await channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await contest_store.mark_result_message(contest.contest_id, message.id)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Could not announce the contest results.")
+            return False
+
+    highest_votes = tallies[0].votes
+    winners = [tally for tally in tallies if tally.votes == highest_votes]
+    leaderboard = "\n".join(contest_leaderboard_lines(tallies))
+
+    if len(winners) == 1:
+        winner = winners[0]
+        name = discord.utils.escape_markdown(winner.entry.contestant_name)
+        embed = discord.Embed(
+            title=f"🏆 {contest.title} Winner!",
+            description=(
+                f"Congratulations to **{name}** with **Entry "
+                f"#{winner.entry.entry_number}**!\n\n{leaderboard}\n\n"
+                f"**Total voters:** {total_votes}"
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        file = contest_file(winner.entry)
+        embed.set_image(url=f"attachment://{file.filename}")
+        try:
+            message = await channel.send(
+                embed=embed,
+                file=file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await contest_store.mark_result_message(contest.contest_id, message.id)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Could not announce the contest winner.")
+            return False
+
+    tied_names = "\n".join(
+        f"• **Entry #{tally.entry.entry_number} — "
+        f"{discord.utils.escape_markdown(tally.entry.contestant_name)}**"
+        for tally in winners
+    )
+    embed = discord.Embed(
+        title=f"🏆 {contest.title} — We Have a Tie!",
+        description=(
+            f"The following entries tied with **{highest_votes} votes** each:\n"
+            f"{tied_names}\n\n{leaderboard}\n\n**Total voters:** {total_votes}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        message = await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await contest_store.mark_result_message(contest.contest_id, message.id)
+        for winner in winners[:10]:
+            file = contest_file(winner.entry)
+            winner_embed = discord.Embed(
+                title=(
+                    f"Tied Winner — Entry #{winner.entry.entry_number}: "
+                    f"{discord.utils.escape_markdown(winner.entry.contestant_name)}"
+                ),
+                color=discord.Color.gold(),
+            )
+            winner_embed.set_image(url=f"attachment://{file.filename}")
+            await channel.send(
+                embed=winner_embed,
+                file=file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Could not announce the tied contest winners.")
+        return False
+
+
+async def close_contest_and_announce(contest_id: int) -> bool:
+    async with contest_action_lock:
+        contest, tallies = await contest_store.close_contest(contest_id)
+        await reveal_and_disable_contest_entries(contest, tallies)
+        return await announce_contest_results(contest, tallies)
+
+
+@tasks.loop(seconds=30)
+async def contest_auto_close_loop() -> None:
+    expired = await contest_store.expired_open_contests(
+        datetime.now(timezone.utc).isoformat()
+    )
+    for contest in expired:
+        try:
+            await close_contest_and_announce(contest.contest_id)
+        except ContestStateError:
+            continue
+        except Exception:
+            log.exception("Automatic close failed for contest %s.", contest.contest_id)
+
+
+contest_group = app_commands.Group(
+    name="contest",
+    description="Create and manage CHiP image contests.",
+)
+
+
+@contest_group.command(name="create", description="Create a new private contest draft.")
+@app_commands.describe(
+    title="Contest title members will see.",
+    duration_hours="Hours voting stays open after publishing (1-768).",
+    anonymous="Hide contestant names until voting closes.",
+)
+@contest_manager_only()
+async def contest_create_command(
+    interaction: discord.Interaction,
+    title: str,
+    duration_hours: int = 72,
+    anonymous: bool = True,
+) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    clean_title = " ".join(title.split())[:100]
+    if len(clean_title) < 3:
+        await interaction.response.send_message(
+            "The contest title must contain at least three characters.",
+            ephemeral=True,
+        )
+        return
+    if duration_hours < 1 or duration_hours > 768:
+        await interaction.response.send_message(
+            "Choose a voting duration between **1 and 768 hours**.",
+            ephemeral=True,
+        )
+        return
+    try:
+        contest = await contest_store.create_contest(
+            interaction.guild.id,
+            clean_title,
+            anonymous,
+            duration_hours,
+            interaction.user.id,
+        )
+    except ContestError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    privacy = "Anonymous until closing" if contest.anonymous else "Names visible"
+    await interaction.response.send_message(
+        f"🍪 Draft created: **{contest.title}**\n"
+        f"Voting duration: **{contest.duration_hours} hours**\n"
+        f"Display: **{privacy}**\n\n"
+        "Next, use `/contest add` for every approved picture.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="add", description="Upload an approved image to the draft.")
+@app_commands.describe(
+    contestant_name="Name to reveal with this entry when the contest closes.",
+    image="PNG, JPG, GIF, or WEBP contest image.",
+)
+@contest_manager_only()
+async def contest_add_command(
+    interaction: discord.Interaction,
+    contestant_name: str,
+    image: discord.Attachment,
+) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    clean_name = " ".join(contestant_name.split())[:80]
+    if not clean_name:
+        await interaction.response.send_message(
+            "Enter the contestant's name.",
+            ephemeral=True,
+        )
+        return
+    if not contest_image_is_supported(image):
+        await interaction.response.send_message(
+            "Please upload a **PNG, JPG, GIF, or WEBP** image.",
+            ephemeral=True,
+        )
+        return
+    if image.size > MAX_CONTEST_IMAGE_BYTES:
+        limit_mb = MAX_CONTEST_IMAGE_BYTES // (1024 * 1024)
+        await interaction.response.send_message(
+            f"That image is too large. The contest limit is **{limit_mb} MB**.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        image_data = await image.read(use_cached=True)
+        if not image_data:
+            raise ContestStateError("Discord returned an empty image file.")
+        entry = await contest_store.add_entry(
+            interaction.guild.id,
+            clean_name,
+            image.filename,
+            image.content_type or "application/octet-stream",
+            image_data,
+            interaction.user.id,
+        )
+    except (ContestError, discord.HTTPException) as error:
+        await interaction.followup.send(
+            f"CHiP could not add that entry: {error}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ Added **{clean_name}** as **Entry #{entry.entry_number}**.\n"
+        "Keep using `/contest add`, then run `/contest preview`.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="remove", description="Remove and renumber a draft entry.")
+@app_commands.describe(entry_number="Entry number shown in the private preview.")
+@contest_manager_only()
+async def contest_remove_command(
+    interaction: discord.Interaction,
+    entry_number: int,
+) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    try:
+        removed = await contest_store.remove_entry(
+            interaction.guild.id,
+            entry_number,
+        )
+    except ContestError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Removed **Entry #{entry_number} — {removed.contestant_name}**. "
+        "The remaining entries were renumbered.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="preview", description="Privately preview the current draft.")
+@contest_manager_only()
+async def contest_preview_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    contest = await contest_store.get_active_contest(interaction.guild.id)
+    if contest is None or contest.status != "draft":
+        await interaction.response.send_message(
+            "There is no draft contest to preview.",
+            ephemeral=True,
+        )
+        return
+    entries = await contest_store.list_entries(
+        contest.contest_id,
+        include_image_data=True,
+    )
+    await interaction.response.send_message(
+        f"🍪 **Private preview: {contest.title}**\n"
+        f"Entries: **{len(entries)}** • Duration: **{contest.duration_hours} hours**\n"
+        "Only you can see these preview messages.",
+        ephemeral=True,
+    )
+    if not entries:
+        await interaction.followup.send(
+            "No images have been added yet.",
+            ephemeral=True,
+        )
+        return
+    for entry in entries[:25]:
+        file = contest_file(entry)
+        embed = contest_entry_embed(
+            contest,
+            entry,
+            image_url=f"attachment://{file.filename}",
+            reveal=True,
+        )
+        await interaction.followup.send(
+            embed=embed,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    if len(entries) > 25:
+        await interaction.followup.send(
+            f"Previewed the first 25 of {len(entries)} entries.",
+            ephemeral=True,
+        )
+
+
+@contest_group.command(name="publish", description="Publish the draft and open voting.")
+@app_commands.describe(channel="Channel where CHiP should post the contest.")
+@contest_manager_only()
+async def contest_publish_command(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    target_channel = channel
+    if target_channel is None and isinstance(interaction.channel, discord.TextChannel):
+        target_channel = interaction.channel
+    if target_channel is None:
+        await interaction.response.send_message(
+            "Choose a standard text channel for the contest.",
+            ephemeral=True,
+        )
+        return
+
+    bot_member = interaction.guild.me
+    if bot_member is None:
+        await interaction.response.send_message(
+            "CHiP could not verify its channel permissions.",
+            ephemeral=True,
+        )
+        return
+    permissions = target_channel.permissions_for(bot_member)
+    missing_permissions = [
+        label
+        for allowed, label in (
+            (permissions.view_channel, "View Channel"),
+            (permissions.send_messages, "Send Messages"),
+            (permissions.embed_links, "Embed Links"),
+            (permissions.attach_files, "Attach Files"),
+            (permissions.read_message_history, "Read Message History"),
+        )
+        if not allowed
+    ]
+    if missing_permissions:
+        await interaction.response.send_message(
+            "CHiP is missing these permissions in that channel: **"
+            + ", ".join(missing_permissions)
+            + "**.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    created_messages: List[discord.Message] = []
+    async with contest_action_lock:
+        contest = await contest_store.get_active_contest(interaction.guild.id)
+        if contest is None or contest.status != "draft":
+            await interaction.followup.send(
+                "There is no draft contest to publish.",
+                ephemeral=True,
+            )
+            return
+        entries = await contest_store.list_entries(
+            contest.contest_id,
+            include_image_data=True,
+        )
+        if len(entries) < 2:
+            await interaction.followup.send(
+                "Add at least **two entries** before publishing.",
+                ephemeral=True,
+            )
+            return
+
+        closes_at = datetime.now(timezone.utc) + timedelta(
+            hours=contest.duration_hours
+        )
+        entry_message_ids: Dict[int, int] = {}
+        try:
+            intro_message = await target_channel.send(
+                embed=contest_intro_embed(contest, closes_at),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            created_messages.append(intro_message)
+            for entry in entries:
+                file = contest_file(entry)
+                view = ContestVoteView(entry.entry_id)
+                entry_message = await target_channel.send(
+                    embed=contest_entry_embed(
+                        contest,
+                        entry,
+                        image_url=f"attachment://{file.filename}",
+                        reveal=False,
+                    ),
+                    file=file,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                created_messages.append(entry_message)
+                entry_message_ids[entry.entry_id] = entry_message.id
+
+            await contest_store.publish_contest(
+                contest.contest_id,
+                target_channel.id,
+                intro_message.id,
+                closes_at.isoformat(),
+                entry_message_ids,
+            )
+        except (ContestError, discord.Forbidden, discord.HTTPException) as error:
+            for message in reversed(created_messages):
+                try:
+                    await message.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            log.exception("Contest publication failed.")
+            await interaction.followup.send(
+                f"CHiP could not publish the contest: {error}",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.followup.send(
+        f"✅ **{contest.title}** is live in {target_channel.mention}!\n"
+        f"Voting closes <t:{int(closes_at.timestamp())}:R>.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="status", description="Privately check the active contest.")
+@contest_manager_only()
+async def contest_status_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    contest = await contest_store.get_active_contest(interaction.guild.id)
+    if contest is None:
+        await interaction.response.send_message(
+            "There is no active draft or open contest.",
+            ephemeral=True,
+        )
+        return
+    entries = await contest_store.list_entries(contest.contest_id)
+    votes = await contest_store.vote_count(contest.contest_id)
+    status_text = "📝 Draft" if contest.status == "draft" else "🟢 Voting open"
+    closes_text = (
+        f"<t:{int(datetime.fromisoformat(contest.closes_at).timestamp())}:F>"
+        if contest.closes_at
+        else "Not scheduled until publication"
+    )
+    entry_lines = "\n".join(
+        f"#{entry.entry_number} — {discord.utils.escape_markdown(entry.contestant_name)}"
+        for entry in entries[:25]
+    ) or "No entries yet"
+    embed = discord.Embed(
+        title=f"🍪 {contest.title}",
+        description=(
+            f"**Status:** {status_text}\n"
+            f"**Entries:** {len(entries)}\n"
+            f"**Votes recorded:** {votes}\n"
+            f"**Closes:** {closes_text}\n\n"
+            f"{entry_lines}"
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@contest_group.command(name="close", description="Close voting now and announce the winner.")
+@contest_manager_only()
+async def contest_close_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    contest = await contest_store.get_active_contest(interaction.guild.id)
+    if contest is None or contest.status != "open":
+        await interaction.response.send_message(
+            "There is no open contest to close.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        announced = await close_contest_and_announce(contest.contest_id)
+    except ContestError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    result_note = "and the results were announced" if announced else "but CHiP could not post the result message"
+    await interaction.followup.send(
+        f"✅ Voting for **{contest.title}** is closed {result_note}.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="cancel", description="Cancel the current unpublished draft.")
+@contest_manager_only()
+async def contest_cancel_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+    try:
+        contest = await contest_store.cancel_draft(interaction.guild.id)
+    except ContestError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Cancelled the unpublished draft **{contest.title}**.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(name="manager-add", description="Allow someone to manage contests.")
+@app_commands.describe(member="MsMax or another trusted contest co-manager.")
+@contest_owner_only()
+async def contest_manager_add_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    if interaction.guild is None:
+        raise ContestOwnerRequired()
+    if member.bot:
+        await interaction.response.send_message(
+            "Contest managers must be human members.",
+            ephemeral=True,
+        )
+        return
+    await contest_store.add_manager(
+        interaction.guild.id,
+        member.id,
+        interaction.user.id,
+    )
+    await interaction.response.send_message(
+        f"✅ {member.mention} can now manage CHiP contests with you.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@contest_group.command(name="manager-remove", description="Remove a contest co-manager.")
+@app_commands.describe(member="Contest co-manager to remove.")
+@contest_owner_only()
+async def contest_manager_remove_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    if interaction.guild is None:
+        raise ContestOwnerRequired()
+    removed = await contest_store.remove_manager(interaction.guild.id, member.id)
+    message = (
+        f"Removed {member.mention} from CHiP's contest managers."
+        if removed
+        else f"{member.mention} was not a saved contest manager."
+    )
+    await interaction.response.send_message(
+        message,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@contest_group.command(name="manager-list", description="List contest managers.")
+@contest_owner_only()
+async def contest_manager_list_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestOwnerRequired()
+    manager_ids = await contest_store.list_managers(interaction.guild.id)
+    mentions = [f"<@{interaction.guild.owner_id}> — Server Owner"]
+    mentions.extend(f"<@{manager_id}>" for manager_id in manager_ids)
+    await interaction.response.send_message(
+        "🍪 **CHiP Contest Managers**\n" + "\n".join(mentions),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 maintenance_group = app_commands.Group(
     name="maintenance",
     description="Control CHiP maintenance mode.",
@@ -1616,14 +2589,15 @@ async def maintenance_start(
     )
 
     description = (
-        "CHiP is undergoing updates. Translation and media relay may be "
-        "temporarily unavailable."
+        "CHiP is currently undergoing maintenance for updates or bug fixes. "
+        "Translation and other CHiP services may be temporarily unavailable. "
+        "We’ll notify everyone when CHiP is back online."
     )
     if clean_reason:
         description += f"\n\n**Reason:** {clean_reason}"
 
     announced = await post_chip_announcement(
-        "🛠️ CHiP Maintenance Started",
+        "🛠️ CHiP Is Under Maintenance",
         description,
         discord.Color.orange(),
     )
@@ -1661,8 +2635,9 @@ async def maintenance_end(interaction: discord.Interaction) -> None:
         activity=discord.Game(name="🍪 Translating CMON"),
     )
     announced = await post_chip_announcement(
-        "✅ CHiP Maintenance Complete",
-        "CHiP is back online. Translation and media relay have resumed.",
+        "✅ CHiP Is Back Online",
+        "Maintenance is complete. Translation and other CHiP services are "
+        "available again.",
         discord.Color.green(),
     )
     language_count = await broadcast_language_notice(MAINTENANCE_END_NOTICES)
@@ -1684,37 +2659,250 @@ async def maintenance_status(interaction: discord.Interaction) -> None:
         if reason:
             details += f"\nReason: {reason}"
     else:
-        details = "Maintenance is **OFF**. CHiP is translating normally."
+        details = "Maintenance is **OFF**. CHiP services are running normally."
     await interaction.response.send_message(details, ephemeral=True)
 
 
-terra_group = app_commands.Group(
-    name="terra",
-    description="Track and control CHiP's Terra usage.",
+chip_group = app_commands.Group(
+    name="chip",
+    description="Talk to and manage CHiP's member chat.",
 )
 
 
-@terra_group.command(name="status", description="Show Terra usage and remaining local budget.")
-@app_commands.checks.has_permissions(administrator=True)
-async def terra_status_command(interaction: discord.Interaction) -> None:
-    status = await get_terra_status()
-    if not terra_clarifier.configured:
-        mode = "⚪ Not configured — Azure-only"
-    elif status.paused:
-        mode = "⏸️ Paused — Azure-only"
-    elif status.remaining_usd <= 0:
-        mode = "🛑 Local cap reached — Azure-only"
-    else:
-        mode = "🟢 Active for Spanish messages"
+@chip_group.command(name="chat", description="Ask CHiP a question or continue your conversation.")
+@app_commands.describe(message="What you want to say to CHiP.")
+async def chip_chat_command(
+    interaction: discord.Interaction,
+    message: str,
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "CHiP chat is available inside the CMON server, not in DMs.",
+            ephemeral=True,
+        )
+        return
 
+    clean_message = message.strip()
+    if not clean_message:
+        await interaction.response.send_message(
+            "Give CHiP a message or question first. 🍪",
+            ephemeral=True,
+        )
+        return
+    if len(clean_message) > CHIP_CHAT_MAX_PROMPT_CHARACTERS:
+        await interaction.response.send_message(
+            f"Please keep each CHiP message under "
+            f"**{CHIP_CHAT_MAX_PROMPT_CHARACTERS:,} characters**.",
+            ephemeral=True,
+        )
+        return
+
+    maintenance_active, _, _ = await maintenance_state()
+    if maintenance_active:
+        await interaction.response.send_message(
+            "🛠️ CHiP is currently under maintenance. Chat will return when "
+            "maintenance is complete.",
+            ephemeral=True,
+        )
+        return
+
+    retry_after = chip_chat_retry_after(
+        interaction.guild_id,
+        interaction.user.id,
+    )
+    if retry_after > 0:
+        await interaction.response.send_message(
+            f"CHiP needs a quick cookie break—try again in **{retry_after:.0f} seconds**.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    try:
+        reply = await generate_chip_chat_reply(
+            clean_message,
+            interaction.guild_id,
+            interaction.user.id,
+            interaction.id,
+        )
+    except ChipChatUnavailable as exc:
+        await interaction.followup.send(
+            str(exc),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    chunks = split_discord_text(reply)
+    for index, chunk in enumerate(chunks):
+        prefix = "🍪 **CHiP:**\n" if index == 0 else ""
+        await interaction.followup.send(
+            prefix + chunk,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+@chip_group.command(name="reset", description="Forget your recent conversation with CHiP.")
+async def chip_reset_command(interaction: discord.Interaction) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "There is no CMON conversation to reset here.",
+            ephemeral=True,
+        )
+        return
+    removed = await chat_history_store.reset(
+        interaction.guild_id,
+        interaction.user.id,
+    )
+    message = (
+        "CHiP forgot your recent conversation. Fresh cookie slate! 🍪"
+        if removed
+        else "CHiP did not have any saved conversation for you yet."
+    )
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+@chip_group.command(name="status", description="Show CHiP chat and shared AI budget status.")
+@app_commands.checks.has_permissions(administrator=True)
+async def chip_status_command(interaction: discord.Interaction) -> None:
+    status = await get_terra_status()
+    paused = await get_setting("chip_chat_paused", "0") == "1"
+    channel_id = await get_chip_chat_channel_id()
+    if not chip_chat_client.configured:
+        mode = "⚪ Not configured"
+    elif paused:
+        mode = "⏸️ Paused by an administrator"
+    elif status.remaining_usd <= 0:
+        mode = "🛑 Shared AI cap reached"
+    else:
+        mode = "🟢 Active"
+    channel_text = (
+        f"<#{channel_id}>"
+        if channel_id
+        else "No dedicated channel — `/chip chat` and @mentions still work"
+    )
     embed = discord.Embed(
-        title="🍪 CHiP Terra Usage",
+        title="🍪 CHiP Member Chat",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="Mode", value=mode, inline=False)
+    embed.add_field(name="Dedicated channel", value=channel_text, inline=False)
+    embed.add_field(name="Model", value=f"`{CHIP_CHAT_MODEL}`", inline=True)
     embed.add_field(
-        name="Tracked total",
+        name="Chat usage",
+        value=f"{status.chat_requests:,} replies · ${status.chat_cost_usd:.4f}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Shared AI cap",
+        value=(
+            f"${status.total_cost_usd:.4f} / ${status.budget_usd:.2f}\n"
+            f"${status.remaining_usd:.4f} remaining"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@chip_group.command(name="channel", description="Choose a channel where members can chat normally with CHiP.")
+@app_commands.describe(channel="The dedicated text channel for CHiP conversations.")
+@app_commands.checks.has_permissions(administrator=True)
+async def chip_channel_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+) -> None:
+    await set_settings({"chip_chat_channel_id": str(channel.id)})
+    await interaction.response.send_message(
+        f"CHiP's dedicated chat channel is now {channel.mention}. Members can "
+        "type there normally, use `/chip chat`, or mention CHiP elsewhere.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@chip_group.command(name="channel-off", description="Turn off CHiP's dedicated chat channel.")
+@app_commands.checks.has_permissions(administrator=True)
+async def chip_channel_off_command(interaction: discord.Interaction) -> None:
+    await set_settings({"chip_chat_channel_id": "0"})
+    await interaction.response.send_message(
+        "The dedicated CHiP chat channel is off. `/chip chat` and direct "
+        "@mentions still work.",
+        ephemeral=True,
+    )
+
+
+@chip_group.command(name="pause", description="Pause member chat without pausing Terra translation.")
+@app_commands.checks.has_permissions(administrator=True)
+async def chip_pause_command(interaction: discord.Interaction) -> None:
+    await set_settings({"chip_chat_paused": "1"})
+    await interaction.response.send_message(
+        "CHiP member chat is **paused**. Translation and contests are unchanged.",
+        ephemeral=True,
+    )
+
+
+@chip_group.command(name="resume", description="Resume member chat if shared budget remains.")
+@app_commands.checks.has_permissions(administrator=True)
+async def chip_resume_command(interaction: discord.Interaction) -> None:
+    if not chip_chat_client.configured:
+        await interaction.response.send_message(
+            "CHiP chat cannot resume because `OPENAI_API_KEY` is not configured "
+            "in Railway.",
+            ephemeral=True,
+        )
+        return
+    status = await get_terra_status()
+    if status.remaining_usd <= 0:
+        await interaction.response.send_message(
+            "CHiP chat cannot resume because the shared AI cap has been reached. "
+            "Add prepaid credit first, then raise `/terra limit`.",
+            ephemeral=True,
+        )
+        return
+    await set_settings({"chip_chat_paused": "0"})
+    await interaction.response.send_message(
+        "CHiP member chat is **active** again. 🍪",
+        ephemeral=True,
+    )
+
+
+terra_group = app_commands.Group(
+    name="terra",
+    description="Track and control CHiP's Terra and shared AI budget.",
+)
+
+
+@terra_group.command(name="status", description="Show Terra, chat, and shared AI budget usage.")
+@app_commands.checks.has_permissions(administrator=True)
+async def terra_status_command(interaction: discord.Interaction) -> None:
+    status = await get_terra_status()
+    chat_paused = await get_setting("chip_chat_paused", "0") == "1"
+    if not terra_clarifier.configured:
+        terra_mode = "⚪ Not configured — Azure-only"
+    elif status.paused:
+        terra_mode = "⏸️ Paused — Azure-only"
+    elif status.remaining_usd <= 0:
+        terra_mode = "🛑 Shared cap reached — Azure-only"
+    else:
+        terra_mode = "🟢 Active for Spanish messages"
+    if not chip_chat_client.configured:
+        chat_mode = "⚪ Not configured"
+    elif chat_paused:
+        chat_mode = "⏸️ Paused"
+    elif status.remaining_usd <= 0:
+        chat_mode = "🛑 Shared cap reached"
+    else:
+        chat_mode = "🟢 Active"
+
+    embed = discord.Embed(
+        title="🍪 CHiP AI Usage & Shared Cap",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Terra translation", value=terra_mode, inline=False)
+    embed.add_field(name="Member chat", value=chat_mode, inline=False)
+    embed.add_field(
+        name="Combined tracked total",
         value=f"${status.total_cost_usd:.4f} / ${status.budget_usd:.2f}",
         inline=True,
     )
@@ -1729,9 +2917,20 @@ async def terra_status_command(interaction: discord.Interaction) -> None:
         inline=True,
     )
     embed.add_field(
-        name="Spanish handled",
-        value=f"{status.total_messages} messages / {status.total_requests} requests",
-        inline=False,
+        name="Terra usage",
+        value=(
+            f"{status.terra_messages:,} Spanish messages / "
+            f"{status.terra_requests:,} requests\n${status.terra_cost_usd:.4f}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Chat usage",
+        value=(
+            f"{status.chat_messages:,} member messages / "
+            f"{status.chat_requests:,} replies\n${status.chat_cost_usd:.4f}"
+        ),
+        inline=True,
     )
     embed.add_field(
         name="Tokens",
@@ -1749,7 +2948,7 @@ async def terra_status_command(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@terra_group.command(name="limit", description="Change CHiP's cumulative Terra spending cap.")
+@terra_group.command(name="limit", description="Change CHiP's cumulative shared AI spending cap.")
 @app_commands.describe(amount_usd="New cumulative cap in US dollars, such as 4.50 or 9.50.")
 @app_commands.checks.has_permissions(administrator=True)
 async def terra_limit_command(
@@ -1772,12 +2971,14 @@ async def terra_limit_command(
     status = await get_terra_status()
     mode_note = (
         " The new cap is already at or below tracked usage, so CHiP will use "
-        "Azure-only until you raise it."
+        "Azure-only for Spanish and member chat will remain unavailable until "
+        "you raise it."
         if status.total_cost_usd >= status.budget_usd
         else ""
     )
     await interaction.response.send_message(
-        f"CHiP's cumulative Terra cap is now **${amount_usd:.2f}**.{mode_note}\n"
+        f"CHiP's cumulative shared AI cap is now **${amount_usd:.2f}**."
+        f"{mode_note}\n"
         "This command does **not** add OpenAI credit or charge your card.",
         ephemeral=True,
     )
@@ -1817,7 +3018,9 @@ async def terra_resume_command(interaction: discord.Interaction) -> None:
     )
 
 
+bot.tree.add_command(contest_group)
 bot.tree.add_command(maintenance_group)
+bot.tree.add_command(chip_group)
 bot.tree.add_command(terra_group)
 
 
@@ -1826,11 +3029,15 @@ async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
+    original_error = getattr(error, "original", error)
+    if isinstance(original_error, ContestOwnerRequired):
+        message = "Only the server owner can change CHiP's contest managers."
+    elif isinstance(original_error, ContestManagerRequired):
+        message = "Only the server owner and approved contest managers can use that command."
+    elif isinstance(original_error, app_commands.MissingPermissions):
         message = "Only a server administrator can use that CHiP command."
     else:
         message = "CHiP could not complete that command. Check the private bot logs."
-        original_error = getattr(error, "original", error)
         log.error(
             "Slash command failed: %s",
             original_error,
@@ -1879,6 +3086,14 @@ async def on_ready():
         bot.add_view(CookieColorView())
         bot.cookie_color_view_added = True
 
+    if not getattr(bot, "contest_views_added", False):
+        restored_views = await restore_contest_vote_views()
+        bot.contest_views_added = True
+        log.info("Restored %s active contest vote buttons.", restored_views)
+
+    if not contest_auto_close_loop.is_running():
+        contest_auto_close_loop.start()
+
     maintenance_active, _, _ = await maintenance_state()
     if maintenance_active:
         await bot.change_presence(
@@ -1903,6 +3118,12 @@ async def on_ready():
         azure_translator.configured,
         terra_clarifier.configured,
         OPENAI_MODEL,
+    )
+    log.info(
+        "Member chat | Luna: %s | Chat model: %s | Dedicated channel: %s",
+        chip_chat_client.configured,
+        CHIP_CHAT_MODEL,
+        await get_chip_chat_channel_id() or "not set",
     )
     print("\nCOOKIE TRANSLATOR IS ONLINE")
     print(f"Logged in as: {bot.user}")
@@ -1996,6 +3217,28 @@ async def cookie_update_error(ctx: commands.Context, error):
         )
     else:
         raise error
+
+
+async def send_chip_message_reply(
+    message: discord.Message,
+    reply: str,
+) -> None:
+    chunks = split_discord_text(reply)
+    for index, chunk in enumerate(chunks):
+        content = ("🍪 **CHiP:**\n" if index == 0 else "") + chunk
+        if index == 0:
+            await message.reply(
+                content,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await message.channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id is not None:
@@ -2013,6 +3256,63 @@ async def on_message(message: discord.Message):
         return
 
     maintenance_active, _, _ = await maintenance_state()
+    chat_channel_id = await get_chip_chat_channel_id()
+    bot_user_id = bot.user.id if bot.user is not None else 0
+    is_direct_mention = bool(
+        bot.user is not None and bot.user in message.mentions
+    )
+    is_chat_channel = bool(
+        chat_channel_id and message.channel.id == chat_channel_id
+    )
+    if is_direct_mention or is_chat_channel:
+        prompt = strip_chip_mention(message.content, bot_user_id)
+        if maintenance_active:
+            await send_chip_message_reply(
+                message,
+                "🛠️ I’m currently under maintenance. Member chat will return "
+                "when maintenance is complete.",
+            )
+            return
+        if not prompt:
+            await send_chip_message_reply(
+                message,
+                "Ask me a text question and I’ll do my best to help! 🍪",
+            )
+            return
+        if len(prompt) > CHIP_CHAT_MAX_PROMPT_CHARACTERS:
+            await send_chip_message_reply(
+                message,
+                f"Please keep each message under "
+                f"{CHIP_CHAT_MAX_PROMPT_CHARACTERS:,} characters.",
+            )
+            return
+
+        retry_after = chip_chat_retry_after(
+            message.guild.id,
+            message.author.id,
+        )
+        if retry_after > 0:
+            await send_chip_message_reply(
+                message,
+                f"I need a quick cookie break—try again in "
+                f"{retry_after:.0f} seconds. 🍪",
+            )
+            return
+
+        try:
+            async with message.channel.typing():
+                reply = await generate_chip_chat_reply(
+                    prompt,
+                    message.guild.id,
+                    message.author.id,
+                    message.id,
+                )
+        except ChipChatUnavailable as exc:
+            await send_chip_message_reply(message, str(exc))
+            return
+        await send_chip_message_reply(message, reply)
+        return
+
     if maintenance_active:
         return
 
@@ -2026,11 +3326,8 @@ async def on_message(message: discord.Message):
         return
 
     group_name, group_channels = active_group
+    original_text = message.content.strip()
     media = await collect_relay_media(message)
-    original_text = strip_relayed_custom_emojis(
-        message.content,
-        media.consumed_text_tokens,
-    )
 
     # Media-only messages bypass both translation providers entirely.
     if not original_text and not media.has_media:
@@ -2217,11 +3514,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     if source_message is None or source_message.author.bot or source_message.webhook_id is not None:
         return
 
+    original_text = source_message.content.strip()
     media = await collect_relay_media(source_message)
-    original_text = strip_relayed_custom_emojis(
-        source_message.content,
-        media.consumed_text_tokens,
-    )
     if not original_text and not media.has_media:
         return
 
