@@ -1331,7 +1331,10 @@ async def translate_for_targets(
     working_text = protected_text
     working_language = source_language
 
-    if source_language == "es":
+    # Human Spanish still uses Terra for slang and jokes. CHiP's own Spanish
+    # is already clean model output, so Azure can translate it directly and
+    # avoid charging the shared AI budget a second time for the same reply.
+    if source_language == "es" and request_kind != "chip_chat_translation":
         clarified = await maybe_clarify_spanish(
             protected_text,
             source_message_id,
@@ -1591,6 +1594,114 @@ async def edit_webhook_relay(
             attachments=[],
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+
+def translation_group_for_channel(
+    channel_id: int,
+) -> Optional[Tuple[str, Dict[int, str]]]:
+    """Return the translation group containing a Discord channel, if any."""
+
+    for group_name, channels in TRANSLATION_GROUPS.items():
+        if channel_id in channels:
+            return group_name, channels
+    return None
+
+
+async def relay_text_across_translation_group(
+    *,
+    guild: discord.Guild,
+    group_name: str,
+    group_channels: Dict[int, str],
+    source_channel_id: int,
+    source_message_id: int,
+    original_text: str,
+    media: RelayMedia,
+    username: str,
+    avatar_url: str,
+    author_id: Optional[int],
+    request_kind: str,
+    include_source: bool = False,
+) -> None:
+    """Mirror one human or CHiP message to every other language channel."""
+
+    source_language = group_channels[source_channel_id]
+    target_languages = [
+        language
+        for channel_id, language in group_channels.items()
+        if channel_id != source_channel_id
+    ]
+    translations = (
+        await translate_for_targets(
+            original_text,
+            source_language,
+            target_languages,
+            source_message_id,
+            request_kind,
+        )
+        if original_text
+        else {}
+    )
+    link_group = uuid.uuid4().hex
+
+    if not include_source:
+        await store_message_link(
+            source_message_id,
+            link_group,
+            source_channel_id,
+            source_language,
+            True,
+            author_id,
+        )
+
+    for target_channel_id, target_language in group_channels.items():
+        if target_channel_id == source_channel_id and not include_source:
+            continue
+
+        target_channel = guild.get_channel(target_channel_id)
+        if not isinstance(target_channel, discord.TextChannel):
+            log.error("Cannot find target text channel ID %s", target_channel_id)
+            continue
+
+        try:
+            webhook = await get_or_create_webhook(target_channel)
+            translated_message = await send_webhook_relay(
+                webhook=webhook,
+                translated_text=(
+                    original_text
+                    if target_channel_id == source_channel_id
+                    else translations.get(target_language, "")
+                ),
+                media=media,
+                username=username,
+                avatar_url=avatar_url,
+            )
+            await store_message_link(
+                translated_message.id,
+                link_group,
+                target_channel_id,
+                target_language,
+                target_channel_id == source_channel_id,
+                author_id,
+            )
+            log.info(
+                "Translated in group %s: %s -> %s for %s",
+                group_name,
+                LANGUAGE_NAMES[source_language],
+                LANGUAGE_NAMES[target_language],
+                username,
+            )
+        except discord.Forbidden:
+            log.exception(
+                "Missing permission in #%s. The bot needs View Channel, "
+                "Send Messages, Read Message History, and Manage Webhooks.",
+                target_channel.name,
+            )
+        except Exception:
+            log.exception(
+                "Translation failed from %s to %s",
+                source_language,
+                target_language,
+            )
 
 
 MAINTENANCE_START_NOTICES = {
@@ -2718,6 +2829,23 @@ async def chip_chat_command(
         return
 
     await interaction.response.defer(thinking=True)
+    active_group = translation_group_for_channel(interaction.channel_id)
+    if active_group is not None and interaction.guild is not None:
+        group_name, group_channels = active_group
+        await relay_text_across_translation_group(
+            guild=interaction.guild,
+            group_name=group_name,
+            group_channels=group_channels,
+            source_channel_id=interaction.channel_id,
+            source_message_id=interaction.id,
+            original_text=clean_message,
+            media=RelayMedia(),
+            username=interaction.user.display_name[:80],
+            avatar_url=str(interaction.user.display_avatar.url),
+            author_id=interaction.user.id,
+            request_kind="message",
+            include_source=True,
+        )
     try:
         reply = await generate_chip_chat_reply(
             clean_message,
@@ -2735,10 +2863,31 @@ async def chip_chat_command(
     chunks = split_discord_text(reply)
     for index, chunk in enumerate(chunks):
         prefix = "🍪 **CHiP:**\n" if index == 0 else ""
-        await interaction.followup.send(
-            prefix + chunk,
+        content = prefix + chunk
+        sent_reply = await interaction.followup.send(
+            content,
             allowed_mentions=discord.AllowedMentions.none(),
+            wait=True,
         )
+        if (
+            active_group is not None
+            and interaction.guild is not None
+            and bot.user is not None
+        ):
+            group_name, group_channels = active_group
+            await relay_text_across_translation_group(
+                guild=interaction.guild,
+                group_name=group_name,
+                group_channels=group_channels,
+                source_channel_id=interaction.channel_id,
+                source_message_id=sent_reply.id,
+                original_text=content,
+                media=RelayMedia(),
+                username=bot.user.name[:80],
+                avatar_url=str(bot.user.display_avatar.url),
+                author_id=bot.user.id,
+                request_kind="chip_chat_translation",
+            )
 
 
 @chip_group.command(name="reset", description="Forget your recent conversation with CHiP.")
@@ -3222,21 +3371,57 @@ async def cookie_update_error(ctx: commands.Context, error):
 async def send_chip_message_reply(
     message: discord.Message,
     reply: str,
-) -> None:
+) -> List[discord.Message]:
+    sent_messages: List[discord.Message] = []
     chunks = split_discord_text(reply)
     for index, chunk in enumerate(chunks):
         content = ("🍪 **CHiP:**\n" if index == 0 else "") + chunk
         if index == 0:
-            await message.reply(
-                content,
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+            sent_messages.append(
+                await message.reply(
+                    content,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             )
         else:
-            await message.channel.send(
-                content,
-                allowed_mentions=discord.AllowedMentions.none(),
+            sent_messages.append(
+                await message.channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             )
+    return sent_messages
+
+
+async def send_and_mirror_chip_reply(
+    message: discord.Message,
+    reply: str,
+    active_group: Optional[Tuple[str, Dict[int, str]]],
+) -> None:
+    """Reply locally, then mirror CHiP's answer to linked language channels."""
+
+    sent_replies = await send_chip_message_reply(message, reply)
+    if active_group is None or bot.user is None:
+        return
+
+    group_name, group_channels = active_group
+    reply_chunks = split_discord_text(reply)
+    for index, (chunk, sent_reply) in enumerate(zip(reply_chunks, sent_replies)):
+        relay_content = ("🍪 **CHiP:**\n" if index == 0 else "") + chunk
+        await relay_text_across_translation_group(
+            guild=message.guild,
+            group_name=group_name,
+            group_channels=group_channels,
+            source_channel_id=message.channel.id,
+            source_message_id=sent_reply.id,
+            original_text=relay_content,
+            media=RelayMedia(),
+            username=bot.user.name[:80],
+            avatar_url=str(bot.user.display_avatar.url),
+            author_id=bot.user.id,
+            request_kind="chip_chat_translation",
+        )
 
 
 @bot.event
@@ -3273,17 +3458,40 @@ async def on_message(message: discord.Message):
                 "when maintenance is complete.",
             )
             return
+
+        active_group = translation_group_for_channel(message.channel.id)
+        if active_group is not None:
+            group_name, group_channels = active_group
+            original_text = message.content.strip()
+            media = await collect_relay_media(message)
+            if original_text or media.has_media:
+                await relay_text_across_translation_group(
+                    guild=message.guild,
+                    group_name=group_name,
+                    group_channels=group_channels,
+                    source_channel_id=message.channel.id,
+                    source_message_id=message.id,
+                    original_text=original_text,
+                    media=media,
+                    username=message.author.display_name[:80],
+                    avatar_url=str(message.author.display_avatar.url),
+                    author_id=message.author.id,
+                    request_kind="message",
+                )
+
         if not prompt:
-            await send_chip_message_reply(
+            await send_and_mirror_chip_reply(
                 message,
                 "Ask me a text question and I’ll do my best to help! 🍪",
+                active_group,
             )
             return
         if len(prompt) > CHIP_CHAT_MAX_PROMPT_CHARACTERS:
-            await send_chip_message_reply(
+            await send_and_mirror_chip_reply(
                 message,
                 f"Please keep each message under "
                 f"{CHIP_CHAT_MAX_PROMPT_CHARACTERS:,} characters.",
+                active_group,
             )
             return
 
@@ -3292,10 +3500,11 @@ async def on_message(message: discord.Message):
             message.author.id,
         )
         if retry_after > 0:
-            await send_chip_message_reply(
+            await send_and_mirror_chip_reply(
                 message,
                 f"I need a quick cookie break—try again in "
                 f"{retry_after:.0f} seconds. 🍪",
+                active_group,
             )
             return
 
@@ -3308,19 +3517,15 @@ async def on_message(message: discord.Message):
                     message.id,
                 )
         except ChipChatUnavailable as exc:
-            await send_chip_message_reply(message, str(exc))
+            await send_and_mirror_chip_reply(message, str(exc), active_group)
             return
-        await send_chip_message_reply(message, reply)
+        await send_and_mirror_chip_reply(message, reply, active_group)
         return
 
     if maintenance_active:
         return
 
-    active_group = None
-    for group_name, channels in TRANSLATION_GROUPS.items():
-        if message.channel.id in channels:
-            active_group = (group_name, channels)
-            break
+    active_group = translation_group_for_channel(message.channel.id)
 
     if active_group is None:
         return
@@ -3333,85 +3538,19 @@ async def on_message(message: discord.Message):
     if not original_text and not media.has_media:
         return
 
-    source_language = group_channels[message.channel.id]
-    username = message.author.display_name[:80]
-    avatar_url = str(message.author.display_avatar.url)
-    link_group = uuid.uuid4().hex
-
-    target_languages = [
-        language
-        for channel_id, language in group_channels.items()
-        if channel_id != message.channel.id
-    ]
-    translations = (
-        await translate_for_targets(
-            original_text,
-            source_language,
-            target_languages,
-            message.id,
-            "message",
-        )
-        if original_text
-        else {}
+    await relay_text_across_translation_group(
+        guild=message.guild,
+        group_name=group_name,
+        group_channels=group_channels,
+        source_channel_id=message.channel.id,
+        source_message_id=message.id,
+        original_text=original_text,
+        media=media,
+        username=message.author.display_name[:80],
+        avatar_url=str(message.author.display_avatar.url),
+        author_id=message.author.id,
+        request_kind="message",
     )
-
-    await store_message_link(
-        message.id,
-        link_group,
-        message.channel.id,
-        source_language,
-        True,
-        message.author.id,
-    )
-
-    for target_channel_id, target_language in group_channels.items():
-        if target_channel_id == message.channel.id:
-            continue
-
-        target_channel = message.guild.get_channel(target_channel_id)
-        if not isinstance(target_channel, discord.TextChannel):
-            log.error("Cannot find target text channel ID %s", target_channel_id)
-            continue
-
-        try:
-            webhook = await get_or_create_webhook(target_channel)
-            translated_message = await send_webhook_relay(
-                webhook=webhook,
-                translated_text=translations.get(target_language, ""),
-                media=media,
-                username=username,
-                avatar_url=avatar_url,
-            )
-
-            await store_message_link(
-                translated_message.id,
-                link_group,
-                target_channel_id,
-                target_language,
-                False,
-                message.author.id,
-            )
-
-            log.info(
-                "Translated in group %s: %s -> %s for %s",
-                group_name,
-                LANGUAGE_NAMES[source_language],
-                LANGUAGE_NAMES[target_language],
-                username,
-            )
-
-        except discord.Forbidden:
-            log.exception(
-                "Missing permission in #%s. The bot needs View Channel, "
-                "Send Messages, Read Message History, and Manage Webhooks.",
-                target_channel.name,
-            )
-        except Exception:
-            log.exception(
-                "Translation failed from %s to %s",
-                source_language,
-                target_language,
-            )
 
 
 

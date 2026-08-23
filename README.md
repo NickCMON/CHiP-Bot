@@ -109,6 +109,12 @@ privately clears the member's own saved conversation. Requests are limited to
 1,500 characters, replies are kept short, and each member has a 15-second
 cooldown to prevent spam and surprise spending.
 
+When a conversation happens in one of the linked general translation channels,
+both the member's message and CHiP's reply are mirrored into every other linked
+language channel. Each copy is translated for that channel, so members following
+the conversation never see only one side of it. Mirrored webhook copies are
+ignored by the chat handler to prevent duplicate answers or reply loops.
+
 Member chat uses GPT-5.6 Luna with no web-search tools and `store=False` API
 requests. It does not read DMs, private messages, or hidden Discord channels.
 At the shared cap, member chat stops automatically while Spanish translation
