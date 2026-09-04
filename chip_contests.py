@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+
+
+CONTEST_ENTRIES_PER_POST = 20
+CONTEST_COLLAGE_COLUMNS = 4
+CONTEST_COLLAGE_CELL_SIZE = 480
+CONTEST_COLLAGE_GAP = 12
+CONTEST_REMINDER_INTERVAL_HOURS = 24
+CONTEST_FINAL_REMINDER_HOURS = 3
 
 
 class ContestError(RuntimeError):
@@ -32,6 +44,9 @@ class ContestRecord:
     intro_message_id: Optional[int]
     result_message_id: Optional[int]
     closes_at: Optional[str]
+    published_at: Optional[str]
+    last_reminded_at: Optional[str]
+    final_reminder_sent: bool
     created_at: str
     closed_at: Optional[str]
 
@@ -65,6 +80,91 @@ class ContestTally:
     votes: int
 
 
+def contest_entry_batches(
+    entries: Sequence[ContestEntryRecord],
+) -> List[List[ContestEntryRecord]]:
+    return [
+        list(entries[index : index + CONTEST_ENTRIES_PER_POST])
+        for index in range(0, len(entries), CONTEST_ENTRIES_PER_POST)
+    ]
+
+
+def _contest_number_font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def build_contest_collage(entries: Sequence[ContestEntryRecord]) -> bytes:
+    if not entries or len(entries) > CONTEST_ENTRIES_PER_POST:
+        raise ContestStateError(
+            f"A contest gallery must contain 1–{CONTEST_ENTRIES_PER_POST} entries."
+        )
+
+    columns = min(CONTEST_COLLAGE_COLUMNS, len(entries))
+    rows = (len(entries) + columns - 1) // columns
+    gap = CONTEST_COLLAGE_GAP
+    cell = CONTEST_COLLAGE_CELL_SIZE
+    width = columns * cell + (columns + 1) * gap
+    height = rows * cell + (rows + 1) * gap
+    collage = Image.new("RGB", (width, height), (30, 31, 34))
+    draw = ImageDraw.Draw(collage)
+    font = _contest_number_font(72)
+
+    for index, entry in enumerate(entries):
+        try:
+            with Image.open(io.BytesIO(entry.image_data)) as uploaded:
+                frame = ImageOps.exif_transpose(uploaded)
+                if getattr(frame, "is_animated", False):
+                    frame.seek(0)
+                tile = ImageOps.fit(
+                    frame.convert("RGB"),
+                    (cell, cell),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
+        except (UnidentifiedImageError, OSError, ValueError) as error:
+            raise ContestStateError(
+                f"Entry #{entry.entry_number} is not a readable image. "
+                "Remove it and upload the picture again."
+            ) from error
+
+        row, column = divmod(index, columns)
+        row_start = row * columns
+        row_count = min(columns, len(entries) - row_start)
+        row_width = row_count * cell + max(row_count - 1, 0) * gap
+        row_offset = (width - row_width) // 2
+        x = row_offset + column * (cell + gap)
+        y = gap + row * (cell + gap)
+        collage.paste(tile, (x, y))
+
+        label = f"#{entry.entry_number}"
+        label_box = draw.textbbox((0, 0), label, font=font, stroke_width=2)
+        label_width = label_box[2] - label_box[0]
+        label_height = label_box[3] - label_box[1]
+        padding_x, padding_y = 18, 12
+        background = (
+            x + 12,
+            y + 12,
+            x + 12 + label_width + padding_x * 2,
+            y + 12 + label_height + padding_y * 2,
+        )
+        draw.rounded_rectangle(background, radius=16, fill=(0, 0, 0))
+        draw.text(
+            (background[0] + padding_x, background[1] + padding_y - label_box[1]),
+            label,
+            font=font,
+            fill=(255, 255, 255),
+            stroke_width=2,
+            stroke_fill=(0, 0, 0),
+        )
+
+    output = io.BytesIO()
+    collage.save(output, format="JPEG", quality=90, optimize=True)
+    return output.getvalue()
+
+
 class ContestStore:
     """SQLite-backed contest storage serialized for safe async bot access."""
 
@@ -80,6 +180,7 @@ class ContestStore:
 
     @staticmethod
     def _contest_from_row(row: sqlite3.Row) -> ContestRecord:
+        keys = set(row.keys())
         return ContestRecord(
             contest_id=int(row["contest_id"]),
             guild_id=int(row["guild_id"]),
@@ -96,6 +197,21 @@ class ContestStore:
                 int(row["result_message_id"]) if row["result_message_id"] else None
             ),
             closes_at=(str(row["closes_at"]) if row["closes_at"] else None),
+            published_at=(
+                str(row["published_at"])
+                if "published_at" in keys and row["published_at"]
+                else None
+            ),
+            last_reminded_at=(
+                str(row["last_reminded_at"])
+                if "last_reminded_at" in keys and row["last_reminded_at"]
+                else None
+            ),
+            final_reminder_sent=(
+                bool(row["final_reminder_sent"])
+                if "final_reminder_sent" in keys
+                else False
+            ),
             created_at=str(row["created_at"]),
             closed_at=(str(row["closed_at"]) if row["closed_at"] else None),
         )
@@ -145,11 +261,27 @@ class ContestStore:
                     intro_message_id INTEGER,
                     result_message_id INTEGER,
                     closes_at TEXT,
+                    published_at TEXT,
+                    last_reminded_at TEXT,
+                    final_reminder_sent INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     closed_at TEXT
                 )
                 """
             )
+            contest_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(contests)")
+            }
+            for column_name, definition in (
+                ("published_at", "TEXT"),
+                ("last_reminded_at", "TEXT"),
+                ("final_reminder_sent", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column_name not in contest_columns:
+                    connection.execute(
+                        f"ALTER TABLE contests ADD COLUMN {column_name} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_contests_one_active_per_guild
@@ -575,6 +707,7 @@ class ContestStore:
         intro_message_id: int,
         closes_at: str,
         entry_message_ids: Dict[int, int],
+        published_at: Optional[str],
     ) -> ContestRecord:
         with self._connect() as connection:
             row = connection.execute(
@@ -596,14 +729,23 @@ class ContestStore:
             if entry_ids != set(entry_message_ids):
                 raise ContestStateError("Every contest entry needs a published image card.")
 
+            reminder_start = published_at or datetime.now(timezone.utc).isoformat()
             connection.execute(
                 """
                 UPDATE contests
                 SET status = 'open', channel_id = ?, intro_message_id = ?,
-                    closes_at = ?
+                    closes_at = ?, published_at = ?, last_reminded_at = ?,
+                    final_reminder_sent = 0
                 WHERE contest_id = ?
                 """,
-                (channel_id, intro_message_id, closes_at, contest_id),
+                (
+                    channel_id,
+                    intro_message_id,
+                    closes_at,
+                    reminder_start,
+                    reminder_start,
+                    contest_id,
+                ),
             )
             connection.executemany(
                 "UPDATE contest_entries SET message_id = ? WHERE entry_id = ?",
@@ -626,6 +768,7 @@ class ContestStore:
         intro_message_id: int,
         closes_at: str,
         entry_message_ids: Dict[int, int],
+        published_at: Optional[str] = None,
     ) -> ContestRecord:
         async with self._lock:
             return await asyncio.to_thread(
@@ -635,7 +778,78 @@ class ContestStore:
                 intro_message_id,
                 closes_at,
                 entry_message_ids,
+                published_at,
             )
+
+    @staticmethod
+    def _parse_utc_timestamp(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _claim_due_reminders_sync(
+        self,
+        now_iso: str,
+    ) -> List[Tuple[ContestRecord, str]]:
+        now = self._parse_utc_timestamp(now_iso)
+        claimed: List[Tuple[ContestRecord, str]] = []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM contests
+                WHERE status = 'open' AND closes_at IS NOT NULL
+                ORDER BY closes_at
+                """
+            ).fetchall()
+            for row in rows:
+                contest = self._contest_from_row(row)
+                closes_at = self._parse_utc_timestamp(contest.closes_at or now_iso)
+                remaining = closes_at - now
+                if remaining <= timedelta(0):
+                    continue
+
+                reminder_kind: Optional[str] = None
+                if (
+                    remaining <= timedelta(hours=CONTEST_FINAL_REMINDER_HOURS)
+                    and not contest.final_reminder_sent
+                ):
+                    reminder_kind = "final"
+                elif remaining > timedelta(hours=CONTEST_FINAL_REMINDER_HOURS):
+                    baseline_text = (
+                        contest.last_reminded_at
+                        or contest.published_at
+                        or contest.created_at
+                    )
+                    baseline = self._parse_utc_timestamp(baseline_text)
+                    if now - baseline >= timedelta(hours=CONTEST_REMINDER_INTERVAL_HOURS):
+                        reminder_kind = "daily"
+
+                if reminder_kind is None:
+                    continue
+
+                connection.execute(
+                    """
+                    UPDATE contests
+                    SET last_reminded_at = ?,
+                        final_reminder_sent = CASE
+                            WHEN ? = 'final' THEN 1
+                            ELSE final_reminder_sent
+                        END
+                    WHERE contest_id = ? AND status = 'open'
+                    """,
+                    (now_iso, reminder_kind, contest.contest_id),
+                )
+                claimed.append((contest, reminder_kind))
+            connection.commit()
+        return claimed
+
+    async def claim_due_reminders(
+        self,
+        now_iso: str,
+    ) -> List[Tuple[ContestRecord, str]]:
+        async with self._lock:
+            return await asyncio.to_thread(self._claim_due_reminders_sync, now_iso)
 
     def _record_vote_sync(self, entry_id: int, user_id: int) -> VoteOutcome:
         with self._connect() as connection:

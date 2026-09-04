@@ -26,12 +26,20 @@ from chip_translation import (
     restore_text,
 )
 from chip_contests import (
+    CONTEST_COLLAGE_CELL_SIZE,
+    CONTEST_COLLAGE_COLUMNS,
+    CONTEST_COLLAGE_GAP,
+    CONTEST_ENTRIES_PER_POST,
     ContestEntryRecord,
     ContestError,
     ContestRecord,
     ContestStateError,
     ContestStore,
     ContestTally,
+    CONTEST_FINAL_REMINDER_HOURS,
+    CONTEST_REMINDER_INTERVAL_HOURS,
+    build_contest_collage,
+    contest_entry_batches,
 )
 from chip_chat import (
     ChatError,
@@ -1794,6 +1802,230 @@ MAINTENANCE_END_NOTICES = {
     ),
 }
 
+CONTEST_NOTICE_TEMPLATES = {
+    "en": {
+        "open": (
+            "🍪 **{title} is open for voting!**\n"
+            "View every cookie profile picture and choose your one favorite.\n"
+            "[View the contest and vote]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **Voting reminder: {title}**\n"
+            "If you haven’t voted yet, view the entries and choose your favorite.\n"
+            "[View the contest and vote]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Final 3 hours to vote: {title}!**\n"
+            "This is your last chance to choose your favorite cookie profile picture.\n"
+            "[View the contest and vote now]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+    },
+    "es": {
+        "open": (
+            "🍪 **¡La votación de {title} ya está abierta!**\n"
+            "Mira todas las fotos de perfil y elige tu favorita.\n"
+            "[Ver el concurso y votar]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **Recordatorio de votación: {title}**\n"
+            "Si aún no has votado, mira las opciones y elige tu favorita.\n"
+            "[Ver el concurso y votar]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **¡Últimas 3 horas para votar en {title}!**\n"
+            "Esta es tu última oportunidad para elegir tu foto de perfil favorita.\n"
+            "[Ver el concurso y votar ahora]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+    },
+    "pt": {
+        "open": (
+            "🍪 **A votação de {title} está aberta!**\n"
+            "Veja todas as fotos de perfil e escolha a sua favorita.\n"
+            "[Ver o concurso e votar]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **Lembrete de votação: {title}**\n"
+            "Se você ainda não votou, veja as opções e escolha a sua favorita.\n"
+            "[Ver o concurso e votar]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Últimas 3 horas para votar em {title}!**\n"
+            "Esta é sua última chance de escolher sua foto de perfil favorita.\n"
+            "[Ver o concurso e votar agora]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+    },
+    "fr": {
+        "open": (
+            "🍪 **Le vote pour {title} est ouvert !**\n"
+            "Regardez toutes les photos de profil et choisissez votre préférée.\n"
+            "[Voir le concours et voter]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **Rappel de vote : {title}**\n"
+            "Si vous n’avez pas encore voté, regardez les choix et sélectionnez votre préféré.\n"
+            "[Voir le concours et voter]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Plus que 3 heures pour voter : {title} !**\n"
+            "C’est votre dernière chance de choisir votre photo de profil préférée.\n"
+            "[Voir le concours et voter maintenant]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+    },
+    "de": {
+        "open": (
+            "🍪 **Die Abstimmung für {title} ist eröffnet!**\n"
+            "Seht euch alle Profilbilder an und wählt euren einen Favoriten.\n"
+            "[Wettbewerb ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **Abstimmungserinnerung: {title}**\n"
+            "Falls ihr noch nicht abgestimmt habt, seht euch die Beiträge an und wählt euren Favoriten.\n"
+            "[Wettbewerb ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Noch 3 Stunden für die Abstimmung: {title}!**\n"
+            "Das ist eure letzte Chance, euer Lieblingsprofilbild zu wählen.\n"
+            "[Jetzt ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+    },
+    "tr": {
+        "open": (
+            "🍪 **{title} oylaması başladı!**\n"
+            "Tüm profil resimlerine bakın ve tek favorinizi seçin.\n"
+            "[Yarışmayı görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+        "daily": (
+            "🍪 **Oylama hatırlatması: {title}**\n"
+            "Henüz oy vermediyseniz seçeneklere bakın ve favorinizi seçin.\n"
+            "[Yarışmayı görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+        "final": (
+            "⏰ **{title} için son 3 saat!**\n"
+            "Favori profil resminizi seçmek için son şansınız.\n"
+            "[Şimdi görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+    },
+    "ar": {
+        "open": (
+            "🍪 **بدأ التصويت في {title}!**\n"
+            "شاهدوا جميع صور الملف الشخصي واختاروا صورة واحدة مفضلة.\n"
+            "[عرض المسابقة والتصويت]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+        "daily": (
+            "🍪 **تذكير بالتصويت: {title}**\n"
+            "إذا لم تصوّت بعد، شاهد المشاركات واختر صورتك المفضلة.\n"
+            "[عرض المسابقة والتصويت]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **آخر 3 ساعات للتصويت في {title}!**\n"
+            "هذه فرصتك الأخيرة لاختيار صورة الملف الشخصي المفضلة لديك.\n"
+            "[عرض المسابقة والتصويت الآن]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+    },
+    "zh-CN": {
+        "open": (
+            "🍪 **{title} 投票现已开始！**\n"
+            "查看所有头像，并选出你唯一的最爱。\n"
+            "[查看比赛并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+        "daily": (
+            "🍪 **投票提醒：{title}**\n"
+            "如果你还没有投票，请查看所有作品并选出你最喜欢的一个。\n"
+            "[查看比赛并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+        "final": (
+            "⏰ **{title} 投票只剩最后 3 小时！**\n"
+            "这是选择你最喜欢头像的最后机会。\n"
+            "[立即查看并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+    },
+}
+
+
+def contest_jump_url(contest: ContestRecord) -> Optional[str]:
+    if not contest.channel_id or not contest.intro_message_id:
+        return None
+    return (
+        f"https://discord.com/channels/{contest.guild_id}/"
+        f"{contest.channel_id}/{contest.intro_message_id}"
+    )
+
+
+def contest_notice_text(
+    contest: ContestRecord,
+    language: str,
+    notice_kind: str,
+) -> Optional[str]:
+    url = contest_jump_url(contest)
+    if url is None or contest.closes_at is None:
+        return None
+    closes = int(datetime.fromisoformat(contest.closes_at).timestamp())
+    templates = CONTEST_NOTICE_TEMPLATES.get(
+        language,
+        CONTEST_NOTICE_TEMPLATES["en"],
+    )
+    template = templates.get(notice_kind, templates["daily"])
+    return template.format(
+        title=discord.utils.escape_markdown(contest.title),
+        url=url,
+        closes=closes,
+    )
+
+
+async def broadcast_contest_notice(
+    contest: ContestRecord,
+    notice_kind: str,
+    *,
+    exclude_channel_id: Optional[int] = None,
+) -> int:
+    sent_count = 0
+    for channel_id, language in GENERAL_CHANNELS.items():
+        if channel_id == exclude_channel_id:
+            continue
+        channel = await get_text_channel(channel_id)
+        if channel is None:
+            continue
+        notice = contest_notice_text(contest, language, notice_kind)
+        if notice is None:
+            continue
+        try:
+            await channel.send(
+                notice,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            sent_count += 1
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception(
+                "Could not send contest %s notice to channel %s.",
+                notice_kind,
+                channel_id,
+            )
+    return sent_count
+
 
 async def post_chip_announcement(
     title: str,
@@ -1922,6 +2154,73 @@ def contest_file(entry: ContestEntryRecord) -> discord.File:
     )
 
 
+def contest_collage_file(
+    contest: ContestRecord,
+    entries: Sequence[ContestEntryRecord],
+) -> discord.File:
+    first_number = entries[0].entry_number
+    last_number = entries[-1].entry_number
+    collage_data = build_contest_collage(entries)
+    return discord.File(
+        io.BytesIO(collage_data),
+        filename=(
+            f"contest_{contest.contest_id}_entries_"
+            f"{first_number}_{last_number}.jpg"
+        ),
+    )
+
+
+def contest_gallery_embed(
+    contest: ContestRecord,
+    entries: Sequence[ContestEntryRecord],
+    *,
+    image_url: str,
+    closes_at: Optional[datetime] = None,
+    tallies: Optional[Sequence[ContestTally]] = None,
+) -> discord.Embed:
+    first_number = entries[0].entry_number
+    last_number = entries[-1].entry_number
+    title = f"🍪 {contest.title} — Entries #{first_number}–#{last_number}"
+
+    if tallies is not None:
+        lines = []
+        for tally in sorted(tallies, key=lambda item: item.entry.entry_number):
+            name = discord.utils.escape_markdown(tally.entry.contestant_name)
+            vote_word = "vote" if tally.votes == 1 else "votes"
+            lines.append(
+                f"**#{tally.entry.entry_number} — {name}:** "
+                f"{tally.votes} {vote_word}"
+            )
+        description = "**Voting is closed.**\n\n" + "\n".join(lines)
+        color = discord.Color.gold()
+    else:
+        if closes_at is None:
+            description = (
+                "This is a private preview. The published contest will show "
+                "numbered vote buttons below this collage."
+            )
+        else:
+            closes_timestamp = int(closes_at.timestamp())
+            anonymity_note = (
+                "Names and vote totals stay hidden until voting closes."
+                if contest.anonymous
+                else "Contestant names are visible in the contest details."
+            )
+            description = (
+                "Tap the collage to enlarge it, then tap the matching numbered "
+                "button below to vote. You may change your vote before closing.\n\n"
+                f"**Voting closes:** <t:{closes_timestamp}:F> "
+                f"(<t:{closes_timestamp}:R>)\n"
+                f"{anonymity_note}"
+            )
+        color = discord.Color.blurple()
+
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_image(url=image_url)
+    embed.set_footer(text="CMON Contest • Powered by CHiP")
+    return embed
+
+
 def contest_entry_embed(
     contest: ContestRecord,
     entry: ContestEntryRecord,
@@ -1979,55 +2278,113 @@ def contest_intro_embed(contest: ContestRecord, closes_at: datetime) -> discord.
     return embed
 
 
+async def record_contest_vote(
+    interaction: discord.Interaction,
+    entry_id: int,
+) -> None:
+    if interaction.guild is None or interaction.user.bot:
+        await interaction.response.send_message(
+            "Only human members inside the CMON server can vote.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        outcome = await contest_store.record_vote(
+            entry_id,
+            interaction.user.id,
+        )
+    except ContestError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    if outcome.already_selected:
+        message = f"🍪 Entry **#{outcome.entry_number}** is already your vote."
+    elif outcome.previous_entry_number is not None:
+        message = (
+            f"✅ Your vote changed from **#{outcome.previous_entry_number}** "
+            f"to **#{outcome.entry_number}**."
+        )
+    else:
+        message = f"✅ Your vote for **Entry #{outcome.entry_number}** is recorded!"
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+class ContestVoteButton(discord.ui.Button):
+    def __init__(
+        self,
+        entry_id: int,
+        entry_number: int,
+        *,
+        row: int = 0,
+        disabled: bool = False,
+        compact: bool = True,
+    ):
+        self.entry_id = entry_id
+        label = f"#{entry_number}" if compact else "Vote"
+        super().__init__(
+            label=label,
+            emoji=None if compact else "🍪",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"chip_contest_vote:{entry_id}",
+            row=row,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await record_contest_vote(interaction, self.entry_id)
+
+
 class ContestVoteView(discord.ui.View):
+    """Legacy single-entry view retained for already-published contests."""
+
     def __init__(self, entry_id: int, *, disabled: bool = False):
         super().__init__(timeout=None)
         self.entry_id = entry_id
-        button = discord.ui.Button(
-            label="Vote",
-            emoji="🍪",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"chip_contest_vote:{entry_id}",
-            disabled=disabled,
+        self.add_item(
+            ContestVoteButton(
+                entry_id,
+                entry_number=entry_id,
+                disabled=disabled,
+                compact=False,
+            )
         )
-        button.callback = self.record_vote
-        self.add_item(button)
 
-    async def record_vote(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or interaction.user.bot:
-            await interaction.response.send_message(
-                "Only human members inside the CMON server can vote.",
-                ephemeral=True,
-            )
-            return
 
-        try:
-            outcome = await contest_store.record_vote(
-                self.entry_id,
-                interaction.user.id,
+class ContestGalleryVoteView(discord.ui.View):
+    def __init__(
+        self,
+        entries: Sequence[ContestEntryRecord],
+        *,
+        disabled: bool = False,
+    ):
+        if not entries or len(entries) > CONTEST_ENTRIES_PER_POST:
+            raise ValueError(
+                f"A contest voting post supports 1–{CONTEST_ENTRIES_PER_POST} entries."
             )
-        except ContestError as error:
-            await interaction.response.send_message(str(error), ephemeral=True)
-            return
-
-        if outcome.already_selected:
-            message = f"🍪 Entry **#{outcome.entry_number}** is already your vote."
-        elif outcome.previous_entry_number is not None:
-            message = (
-                f"✅ Your vote changed from **#{outcome.previous_entry_number}** "
-                f"to **#{outcome.entry_number}**."
+        super().__init__(timeout=None)
+        for index, entry in enumerate(entries):
+            self.add_item(
+                ContestVoteButton(
+                    entry.entry_id,
+                    entry.entry_number,
+                    row=index // 5,
+                    disabled=disabled,
+                )
             )
-        else:
-            message = f"✅ Your vote for **Entry #{outcome.entry_number}** is recorded!"
-        await interaction.response.send_message(message, ephemeral=True)
 
 
 async def restore_contest_vote_views() -> int:
-    restored = 0
+    entries_by_message: Dict[int, List[ContestEntryRecord]] = {}
     for entry_id, message_id in await contest_store.open_entry_message_ids():
-        bot.add_view(ContestVoteView(entry_id), message_id=message_id)
-        restored += 1
-    return restored
+        entry = await contest_store.get_entry(entry_id)
+        if entry is not None:
+            entries_by_message.setdefault(message_id, []).append(entry)
+
+    for message_id, entries in entries_by_message.items():
+        entries.sort(key=lambda item: item.entry_number)
+        bot.add_view(ContestGalleryVoteView(entries), message_id=message_id)
+    return len(entries_by_message)
 
 
 def contest_leaderboard_lines(tallies: Sequence[ContestTally]) -> List[str]:
@@ -2052,36 +2409,34 @@ async def reveal_and_disable_contest_entries(
     channel = await get_text_channel(contest.channel_id)
     if channel is None:
         return
-    highest_votes = max((tally.votes for tally in tallies), default=0)
-    unique_winner = sum(
-        1 for tally in tallies if highest_votes > 0 and tally.votes == highest_votes
-    ) == 1
-
+    tallies_by_message: Dict[int, List[ContestTally]] = {}
     for tally in tallies:
-        if not tally.entry.message_id:
-            continue
+        if tally.entry.message_id:
+            tallies_by_message.setdefault(tally.entry.message_id, []).append(tally)
+
+    for message_id, message_tallies in tallies_by_message.items():
         try:
-            message = await channel.fetch_message(tally.entry.message_id)
+            message_tallies.sort(key=lambda item: item.entry.entry_number)
+            message = await channel.fetch_message(message_id)
             image_url = (
                 message.attachments[0].url
                 if message.attachments
                 else "https://cdn.discordapp.com/embed/avatars/0.png"
             )
+            message_entries = [tally.entry for tally in message_tallies]
             await message.edit(
-                embed=contest_entry_embed(
+                embed=contest_gallery_embed(
                     contest,
-                    tally.entry,
+                    message_entries,
                     image_url=image_url,
-                    reveal=True,
-                    votes=tally.votes,
-                    winner=unique_winner and tally.votes == highest_votes,
+                    tallies=message_tallies,
                 ),
-                view=ContestVoteView(tally.entry.entry_id, disabled=True),
+                view=ContestGalleryVoteView(message_entries, disabled=True),
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             log.exception(
                 "Could not close contest entry message %s.",
-                tally.entry.message_id,
+                message_id,
             )
 
 
@@ -2195,9 +2550,8 @@ async def close_contest_and_announce(contest_id: int) -> bool:
 
 @tasks.loop(seconds=30)
 async def contest_auto_close_loop() -> None:
-    expired = await contest_store.expired_open_contests(
-        datetime.now(timezone.utc).isoformat()
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    expired = await contest_store.expired_open_contests(now_iso)
     for contest in expired:
         try:
             await close_contest_and_announce(contest.contest_id)
@@ -2205,6 +2559,16 @@ async def contest_auto_close_loop() -> None:
             continue
         except Exception:
             log.exception("Automatic close failed for contest %s.", contest.contest_id)
+
+    for contest, reminder_kind in await contest_store.claim_due_reminders(now_iso):
+        try:
+            await broadcast_contest_notice(contest, reminder_kind)
+        except Exception:
+            log.exception(
+                "Automatic %s reminder failed for contest %s.",
+                reminder_kind,
+                contest.contest_id,
+            )
 
 
 contest_group = app_commands.Group(
@@ -2376,23 +2740,23 @@ async def contest_preview_command(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    for entry in entries[:25]:
-        file = contest_file(entry)
-        embed = contest_entry_embed(
-            contest,
-            entry,
-            image_url=f"attachment://{file.filename}",
-            reveal=True,
-        )
+    try:
+        for batch in contest_entry_batches(entries):
+            file = await asyncio.to_thread(contest_collage_file, contest, batch)
+            embed = contest_gallery_embed(
+                contest,
+                batch,
+                image_url=f"attachment://{file.filename}",
+            )
+            await interaction.followup.send(
+                embed=embed,
+                file=file,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+    except (ContestError, discord.HTTPException) as error:
         await interaction.followup.send(
-            embed=embed,
-            file=file,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    if len(entries) > 25:
-        await interaction.followup.send(
-            f"Previewed the first 25 of {len(entries)} entries.",
+            f"CHiP could not build the preview: {error}",
             ephemeral=True,
         )
 
@@ -2446,6 +2810,7 @@ async def contest_publish_command(
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     created_messages: List[discord.Message] = []
+    published_contest: Optional[ContestRecord] = None
     async with contest_action_lock:
         contest = await contest_store.get_active_contest(interaction.guild.id)
         if contest is None or contest.status != "draft":
@@ -2470,34 +2835,37 @@ async def contest_publish_command(
         )
         entry_message_ids: Dict[int, int] = {}
         try:
-            intro_message = await target_channel.send(
-                embed=contest_intro_embed(contest, closes_at),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            created_messages.append(intro_message)
-            for entry in entries:
-                file = contest_file(entry)
-                view = ContestVoteView(entry.entry_id)
-                entry_message = await target_channel.send(
-                    embed=contest_entry_embed(
+            intro_message: Optional[discord.Message] = None
+            for batch in contest_entry_batches(entries):
+                file = await asyncio.to_thread(contest_collage_file, contest, batch)
+                view = ContestGalleryVoteView(batch)
+                gallery_message = await target_channel.send(
+                    embed=contest_gallery_embed(
                         contest,
-                        entry,
+                        batch,
                         image_url=f"attachment://{file.filename}",
-                        reveal=False,
+                        closes_at=closes_at,
                     ),
                     file=file,
                     view=view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-                created_messages.append(entry_message)
-                entry_message_ids[entry.entry_id] = entry_message.id
+                if intro_message is None:
+                    intro_message = gallery_message
+                created_messages.append(gallery_message)
+                for entry in batch:
+                    entry_message_ids[entry.entry_id] = gallery_message.id
 
-            await contest_store.publish_contest(
+            if intro_message is None:
+                raise ContestStateError("The contest has no entries to publish.")
+
+            published_contest = await contest_store.publish_contest(
                 contest.contest_id,
                 target_channel.id,
                 intro_message.id,
                 closes_at.isoformat(),
                 entry_message_ids,
+                datetime.now(timezone.utc).isoformat(),
             )
         except (ContestError, discord.Forbidden, discord.HTTPException) as error:
             for message in reversed(created_messages):
@@ -2512,9 +2880,51 @@ async def contest_publish_command(
             )
             return
 
+    if published_contest is not None:
+        await broadcast_contest_notice(
+            published_contest,
+            "open",
+            exclude_channel_id=target_channel.id,
+        )
+
     await interaction.followup.send(
         f"✅ **{contest.title}** is live in {target_channel.mention}!\n"
-        f"Voting closes <t:{int(closes_at.timestamp())}:R>.",
+        f"Voting closes <t:{int(closes_at.timestamp())}:R>.\n"
+        f"CHiP will remind every general-language chat every **{CONTEST_REMINDER_INTERVAL_HOURS} hours**, "
+        f"plus once more during the **final {CONTEST_FINAL_REMINDER_HOURS} hours**.",
+        ephemeral=True,
+    )
+
+
+@contest_group.command(
+    name="reminder",
+    description="Send an extra voting reminder to every general-language chat.",
+)
+@contest_manager_only()
+async def contest_reminder_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        raise ContestManagerRequired()
+
+    contest = await contest_store.get_active_contest(interaction.guild.id)
+    if contest is None or contest.status != "open":
+        await interaction.response.send_message(
+            "There is no open contest to remind members about.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    sent_count = await broadcast_contest_notice(contest, "daily")
+    if sent_count == 0:
+        await interaction.followup.send(
+            "CHiP could not send the reminder to any configured General language channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"🍪 Extra contest reminder sent to **{sent_count}** General language "
+        "channel(s). The automatic 24-hour timer was not changed.",
         ephemeral=True,
     )
 
@@ -2550,6 +2960,7 @@ async def contest_status_command(interaction: discord.Interaction) -> None:
             f"**Entries:** {len(entries)}\n"
             f"**Votes recorded:** {votes}\n"
             f"**Closes:** {closes_text}\n\n"
+            f"**Reminders:** Every {CONTEST_REMINDER_INTERVAL_HOURS} hours + final {CONTEST_FINAL_REMINDER_HOURS} hours\n\n"
             f"{entry_lines}"
         ),
         color=discord.Color.blurple(),

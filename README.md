@@ -125,10 +125,17 @@ Administrator permission.
 
 ## Recurring image contests
 
-CHiP can stage approved profile pictures, publish a polished image gallery with
-one persistent **Vote** button per entry, keep totals hidden, allow one
-changeable vote per member, close automatically, reveal the names, and announce
-the winner or tied winners. The contest system never calls Azure or Terra.
+CHiP can stage approved profile pictures and combine up to 20 entries into each
+high-resolution numbered collage. Every gallery post has matching numbered vote
+buttons (five per row). Totals stay hidden, each member has one changeable vote,
+and CHiP closes automatically, reveals the names, and announces the winner or
+tied winners. Contests above 20 entries continue in a second gallery post. The
+contest system never calls Azure or Terra.
+
+When voting opens, CHiP posts a localized announcement with a direct contest
+link in every configured general-language channel. It then sends a reminder
+every 24 hours and one final reminder when 3 hours remain. The reminders do not
+ping `@everyone` and do not use Azure, Terra, or Luna.
 
 The Discord server owner is always a contest manager. The owner should run this
 once to authorize MsMax:
@@ -142,9 +149,11 @@ Normal contest workflow:
 1. `/contest create title:<title> duration_hours:<hours> anonymous:true`
 2. Run `/contest add contestant_name:<name> image:<attachment>` for every
    approved image received by Nick or JC.
-3. `/contest preview` privately displays the staged entries.
-4. `/contest publish channel:<contest-channel>` posts the gallery and opens
-   voting.
+3. `/contest preview` privately displays the same compact collages members will
+   see.
+4. `/contest publish channel:<contest-channel>` posts each 20-entry collage with
+   its matching numbered buttons, opens voting, and announces it in every
+   general-language channel.
 5. CHiP closes automatically at the deadline, or a manager can run
    `/contest close` early.
 
@@ -160,7 +169,7 @@ Additional management commands:
 
 Only the server owner and saved contest managers can use contest-management
 commands. Regular members do not submit anything to CHiP; they only press a
-Vote button. Uploaded contest images default to a 10 MB maximum, configurable
+numbered Vote button. Uploaded contest images default to a 10 MB maximum, configurable
 with `MAX_CONTEST_IMAGE_MB`.
 
 ## Emoji, sticker, GIF, and attachment relay
