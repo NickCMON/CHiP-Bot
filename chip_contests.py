@@ -15,8 +15,6 @@ CONTEST_ENTRIES_PER_POST = 20
 CONTEST_COLLAGE_COLUMNS = 4
 CONTEST_COLLAGE_CELL_SIZE = 480
 CONTEST_COLLAGE_GAP = 12
-CONTEST_REMINDER_INTERVAL_HOURS = 24
-CONTEST_FINAL_REMINDER_HOURS = 3
 
 
 class ContestError(RuntimeError):
@@ -335,6 +333,18 @@ class ContestStore:
                 ON contest_votes(entry_id)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS contest_reminder_subscriptions (
+                    contest_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (contest_id, user_id),
+                    FOREIGN KEY (contest_id) REFERENCES contests(contest_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
             connection.commit()
 
     async def initialize(self) -> None:
@@ -502,13 +512,16 @@ class ContestStore:
             contest_row = connection.execute(
                 """
                 SELECT * FROM contests
-                WHERE guild_id = ? AND status = 'draft'
+                WHERE guild_id = ? AND status IN ('draft', 'open')
                 ORDER BY contest_id DESC LIMIT 1
                 """,
                 (guild_id,),
             ).fetchone()
             if not contest_row:
-                raise ContestNotFound("Create a draft contest before adding entries.")
+                raise ContestNotFound(
+                    "Create a contest before adding entries, or make sure voting "
+                    "is still open."
+                )
             contest = self._contest_from_row(contest_row)
             number_row = connection.execute(
                 """
@@ -561,6 +574,46 @@ class ContestStore:
                 content_type,
                 image_data,
                 created_by,
+            )
+
+    def _set_entry_message_sync(self, entry_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE contest_entries SET message_id = ? WHERE entry_id = ?",
+                (message_id, entry_id),
+            )
+            if cursor.rowcount != 1:
+                raise ContestNotFound("That contest entry no longer exists.")
+            connection.commit()
+
+    async def set_entry_message(self, entry_id: int, message_id: int) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                self._set_entry_message_sync,
+                entry_id,
+                message_id,
+            )
+
+    def _delete_unvoted_entry_sync(self, entry_id: int) -> bool:
+        with self._connect() as connection:
+            vote = connection.execute(
+                "SELECT 1 FROM contest_votes WHERE entry_id = ? LIMIT 1",
+                (entry_id,),
+            ).fetchone()
+            if vote:
+                return False
+            cursor = connection.execute(
+                "DELETE FROM contest_entries WHERE entry_id = ?",
+                (entry_id,),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    async def delete_unvoted_entry(self, entry_id: int) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._delete_unvoted_entry_sync,
+                entry_id,
             )
 
     def _list_entries_sync(
@@ -673,18 +726,18 @@ class ContestStore:
                 self._remove_entry_sync, guild_id, entry_number
             )
 
-    def _cancel_draft_sync(self, guild_id: int) -> ContestRecord:
+    def _cancel_active_contest_sync(self, guild_id: int) -> ContestRecord:
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM contests
-                WHERE guild_id = ? AND status = 'draft'
+                WHERE guild_id = ? AND status IN ('draft', 'open')
                 ORDER BY contest_id DESC LIMIT 1
                 """,
                 (guild_id,),
             ).fetchone()
             if not row:
-                raise ContestNotFound("There is no draft contest to cancel.")
+                raise ContestNotFound("There is no active contest to cancel.")
             contest = self._contest_from_row(row)
             connection.execute(
                 """
@@ -693,12 +746,28 @@ class ContestStore:
                 """,
                 (contest.contest_id,),
             )
+            connection.execute(
+                """
+                DELETE FROM contest_reminder_subscriptions
+                WHERE contest_id = ?
+                """,
+                (contest.contest_id,),
+            )
             connection.commit()
         return contest
 
-    async def cancel_draft(self, guild_id: int) -> ContestRecord:
+    async def cancel_active_contest(self, guild_id: int) -> ContestRecord:
         async with self._lock:
-            return await asyncio.to_thread(self._cancel_draft_sync, guild_id)
+            return await asyncio.to_thread(
+                self._cancel_active_contest_sync,
+                guild_id,
+            )
+
+    async def cancel_draft(self, guild_id: int) -> ContestRecord:
+        contest = await self.get_active_contest(guild_id)
+        if contest is None or contest.status != "draft":
+            raise ContestNotFound("There is no draft contest to cancel.")
+        return await self.cancel_active_contest(guild_id)
 
     def _publish_contest_sync(
         self,
@@ -811,18 +880,18 @@ class ContestStore:
 
                 reminder_kind: Optional[str] = None
                 if (
-                    remaining <= timedelta(hours=CONTEST_FINAL_REMINDER_HOURS)
+                    remaining <= timedelta(hours=1)
                     and not contest.final_reminder_sent
                 ):
                     reminder_kind = "final"
-                elif remaining > timedelta(hours=CONTEST_FINAL_REMINDER_HOURS):
+                elif remaining > timedelta(hours=1):
                     baseline_text = (
                         contest.last_reminded_at
                         or contest.published_at
                         or contest.created_at
                     )
                     baseline = self._parse_utc_timestamp(baseline_text)
-                    if now - baseline >= timedelta(hours=CONTEST_REMINDER_INTERVAL_HOURS):
+                    if now - baseline >= timedelta(hours=24):
                         reminder_kind = "daily"
 
                 if reminder_kind is None:
@@ -850,6 +919,112 @@ class ContestStore:
     ) -> List[Tuple[ContestRecord, str]]:
         async with self._lock:
             return await asyncio.to_thread(self._claim_due_reminders_sync, now_iso)
+
+    def _toggle_reminder_subscription_sync(
+        self,
+        contest_id: int,
+        user_id: int,
+    ) -> bool:
+        """Toggle one member's opt-in and return True when reminders are enabled."""
+
+        with self._connect() as connection:
+            contest_row = connection.execute(
+                "SELECT * FROM contests WHERE contest_id = ?",
+                (contest_id,),
+            ).fetchone()
+            if not contest_row:
+                raise ContestNotFound("That contest no longer exists.")
+            contest = self._contest_from_row(contest_row)
+            if contest.status != "open":
+                raise ContestStateError(
+                    "Private reminders are available only while voting is open."
+                )
+
+            existing = connection.execute(
+                """
+                SELECT 1 FROM contest_reminder_subscriptions
+                WHERE contest_id = ? AND user_id = ?
+                """,
+                (contest_id, user_id),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    """
+                    DELETE FROM contest_reminder_subscriptions
+                    WHERE contest_id = ? AND user_id = ?
+                    """,
+                    (contest_id, user_id),
+                )
+                enabled = False
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO contest_reminder_subscriptions (contest_id, user_id)
+                    VALUES (?, ?)
+                    """,
+                    (contest_id, user_id),
+                )
+                enabled = True
+            connection.commit()
+        return enabled
+
+    async def toggle_reminder_subscription(
+        self,
+        contest_id: int,
+        user_id: int,
+    ) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._toggle_reminder_subscription_sync,
+                contest_id,
+                user_id,
+            )
+
+    def _remove_reminder_subscription_sync(
+        self,
+        contest_id: int,
+        user_id: int,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM contest_reminder_subscriptions
+                WHERE contest_id = ? AND user_id = ?
+                """,
+                (contest_id, user_id),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    async def remove_reminder_subscription(
+        self,
+        contest_id: int,
+        user_id: int,
+    ) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._remove_reminder_subscription_sync,
+                contest_id,
+                user_id,
+            )
+
+    def _list_reminder_subscribers_sync(self, contest_id: int) -> List[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id FROM contest_reminder_subscriptions
+                WHERE contest_id = ? ORDER BY created_at, user_id
+                """,
+                (contest_id,),
+            ).fetchall()
+        return [int(row["user_id"]) for row in rows]
+
+    async def list_reminder_subscribers(self, contest_id: int) -> List[int]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._list_reminder_subscribers_sync,
+                contest_id,
+            )
 
     def _record_vote_sync(self, entry_id: int, user_id: int) -> VoteOutcome:
         with self._connect() as connection:
@@ -939,6 +1114,13 @@ class ContestStore:
                 UPDATE contests
                 SET status = 'closed', closed_at = CURRENT_TIMESTAMP
                 WHERE contest_id = ? AND status = 'open'
+                """,
+                (contest_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM contest_reminder_subscriptions
+                WHERE contest_id = ?
                 """,
                 (contest_id,),
             )

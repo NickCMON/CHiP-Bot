@@ -134,8 +134,16 @@ contest system never calls Azure or Terra.
 
 When voting opens, CHiP posts a localized announcement with a direct contest
 link in every configured general-language channel. It then sends a reminder
-every 24 hours and one final reminder when 3 hours remain. The reminders do not
+every 24 hours and one final reminder during the last hour. The reminders do not
 ping `@everyone` and do not use Azure, Terra, or Luna.
+
+Every contest gallery and localized announcement also includes a
+**🔔 Private Reminders** button. Members must opt in themselves. CHiP first sends
+an immediate confirmation DM, then privately sends the 24-hour and final-hour
+reminders in the language from that member's current language role. English is
+used when no language role is selected. Tapping the button again turns private
+reminders off. If Discord blocks the confirmation DM, CHiP does not subscribe
+the member. Closing or canceling the contest deletes all remaining opt-ins.
 
 The Discord server owner is always a contest manager. The owner should run this
 once to authorize MsMax:
@@ -157,13 +165,20 @@ Normal contest workflow:
 5. CHiP closes automatically at the deadline, or a manager can run
    `/contest close` early.
 
+If someone was missed after publication, run `/contest add` normally while the
+contest is still open. CHiP automatically rebuilds the affected collage (or
+starts the next 20-entry post), adds the new numbered button, and preserves all
+existing votes.
+
 Additional management commands:
 
 - `/contest remove entry_number:<number>` — removes an entry from a draft and
   renumbers the remaining images.
 - `/contest status` — privately shows entries, vote participation, and closing
   time without exposing who is winning.
-- `/contest cancel` — discards an unpublished draft.
+- `/contest cancel reason:<optional>` — discards a draft or ends a live contest
+  without announcing any winner, rankings, names, or vote totals. Live gallery
+  buttons are disabled and reminders stop immediately.
 - `/contest manager-list` and `/contest manager-remove` — owner-only manager
   controls.
 

@@ -36,8 +36,6 @@ from chip_contests import (
     ContestStateError,
     ContestStore,
     ContestTally,
-    CONTEST_FINAL_REMINDER_HOURS,
-    CONTEST_REMINDER_INTERVAL_HOURS,
     build_contest_collage,
     contest_entry_batches,
 )
@@ -750,6 +748,26 @@ LANGUAGE_ROLE_IDS = {
     ARABIC_ROLE_ID,
     CHINESE_ROLE_ID
 }
+LANGUAGE_ROLE_TO_CODE = {
+    ENGLISH_ROLE_ID: "en",
+    SPANISH_ROLE_ID: "es",
+    PORTUGUESE_ROLE_ID: "pt",
+    FRENCH_ROLE_ID: "fr",
+    GERMAN_ROLE_ID: "de",
+    TURKISH_ROLE_ID: "tr",
+    ARABIC_ROLE_ID: "ar",
+    CHINESE_ROLE_ID: "zh-CN",
+}
+
+
+def member_language(member: discord.Member) -> str:
+    """Resolve the member's current language role, defaulting safely to English."""
+
+    role_ids = {role.id for role in member.roles}
+    for role_id, language in LANGUAGE_ROLE_TO_CODE.items():
+        if role_id in role_ids:
+            return language
+    return "en"
 
 
 async def set_language_role(interaction: discord.Interaction, role_id: int, language_name: str):
@@ -1817,7 +1835,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "Voting closes <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **Final 3 hours to vote: {title}!**\n"
+            "⏰ **Final hour to vote: {title}!**\n"
             "This is your last chance to choose your favorite cookie profile picture.\n"
             "[View the contest and vote now]({url})\n"
             "Voting closes <t:{closes}:R>."
@@ -1837,7 +1855,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "La votación termina <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **¡Últimas 3 horas para votar en {title}!**\n"
+            "⏰ **¡Última hora para votar en {title}!**\n"
             "Esta es tu última oportunidad para elegir tu foto de perfil favorita.\n"
             "[Ver el concurso y votar ahora]({url})\n"
             "La votación termina <t:{closes}:R>."
@@ -1857,7 +1875,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "A votação termina <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **Últimas 3 horas para votar em {title}!**\n"
+            "⏰ **Última hora para votar em {title}!**\n"
             "Esta é sua última chance de escolher sua foto de perfil favorita.\n"
             "[Ver o concurso e votar agora]({url})\n"
             "A votação termina <t:{closes}:R>."
@@ -1877,7 +1895,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "Le vote se termine <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **Plus que 3 heures pour voter : {title} !**\n"
+            "⏰ **Dernière heure pour voter : {title} !**\n"
             "C’est votre dernière chance de choisir votre photo de profil préférée.\n"
             "[Voir le concours et voter maintenant]({url})\n"
             "Le vote se termine <t:{closes}:R>."
@@ -1897,7 +1915,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "Die Abstimmung endet <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **Noch 3 Stunden für die Abstimmung: {title}!**\n"
+            "⏰ **Letzte Stunde für die Abstimmung: {title}!**\n"
             "Das ist eure letzte Chance, euer Lieblingsprofilbild zu wählen.\n"
             "[Jetzt ansehen und abstimmen]({url})\n"
             "Die Abstimmung endet <t:{closes}:R>."
@@ -1917,7 +1935,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "Oylama <t:{closes}:R> sona erecek."
         ),
         "final": (
-            "⏰ **{title} için son 3 saat!**\n"
+            "⏰ **{title} için son bir saat!**\n"
             "Favori profil resminizi seçmek için son şansınız.\n"
             "[Şimdi görüntüle ve oy ver]({url})\n"
             "Oylama <t:{closes}:R> sona erecek."
@@ -1937,7 +1955,7 @@ CONTEST_NOTICE_TEMPLATES = {
             "ينتهي التصويت <t:{closes}:R>."
         ),
         "final": (
-            "⏰ **آخر 3 ساعات للتصويت في {title}!**\n"
+            "⏰ **الساعة الأخيرة للتصويت في {title}!**\n"
             "هذه فرصتك الأخيرة لاختيار صورة الملف الشخصي المفضلة لديك.\n"
             "[عرض المسابقة والتصويت الآن]({url})\n"
             "ينتهي التصويت <t:{closes}:R>."
@@ -1957,9 +1975,217 @@ CONTEST_NOTICE_TEMPLATES = {
             "投票将于 <t:{closes}:R> 结束。"
         ),
         "final": (
-            "⏰ **{title} 投票只剩最后 3 小时！**\n"
+            "⏰ **{title} 投票只剩最后一小时！**\n"
             "这是选择你最喜欢头像的最后机会。\n"
             "[立即查看并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+    },
+}
+
+CONTEST_PRIVATE_REMINDER_PROMPTS = {
+    "en": "Want private reminders? Tap **🔔 Private Reminders** below.",
+    "es": "¿Quieres recordatorios privados? Pulsa **🔔 Recordatorios privados** abajo.",
+    "pt": "Quer lembretes privados? Toque em **🔔 Lembretes privados** abaixo.",
+    "fr": "Vous voulez des rappels privés ? Appuyez sur **🔔 Rappels privés** ci-dessous.",
+    "de": "Möchtest du private Erinnerungen? Tippe unten auf **🔔 Private Erinnerungen**.",
+    "tr": "Özel hatırlatmalar ister misiniz? Aşağıdaki **🔔 Özel Hatırlatmalar** düğmesine dokunun.",
+    "ar": "هل تريد تذكيرات خاصة؟ اضغط على **🔔 تذكيرات خاصة** أدناه.",
+    "zh-CN": "想接收私信提醒？请点击下方的 **🔔 私信提醒**。",
+}
+
+CONTEST_REMINDER_BUTTON_LABELS = {
+    "en": "Private Reminders",
+    "es": "Recordatorios privados",
+    "pt": "Lembretes privados",
+    "fr": "Rappels privés",
+    "de": "Private Erinnerungen",
+    "tr": "Özel Hatırlatmalar",
+    "ar": "تذكيرات خاصة",
+    "zh-CN": "私信提醒",
+}
+
+CONTEST_PRIVATE_DM_TEMPLATES = {
+    "en": {
+        "enabled": (
+            "🔔 **Private reminders are on for {title}.**\n"
+            "I’ll message you at the next 24-hour reminder and during the final hour.\n"
+            "[View the contest and vote]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+        "disabled": "🔕 Private reminders are now off for **{title}**.",
+        "unavailable": (
+            "I couldn’t send you a DM, so private reminders were not enabled. "
+            "Allow direct messages from server members, then tap the button again."
+        ),
+        "daily": (
+            "🍪 **Private voting reminder: {title}**\n"
+            "[View the entries and vote]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Final hour to vote: {title}!**\n"
+            "[View the entries and vote now]({url})\n"
+            "Voting closes <t:{closes}:R>."
+        ),
+    },
+    "es": {
+        "enabled": (
+            "🔔 **Los recordatorios privados están activados para {title}.**\n"
+            "Te escribiré en el próximo recordatorio de 24 horas y durante la última hora.\n"
+            "[Ver el concurso y votar]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+        "disabled": "🔕 Los recordatorios privados están desactivados para **{title}**.",
+        "unavailable": (
+            "No pude enviarte un mensaje privado, así que no se activaron los recordatorios. "
+            "Permite mensajes directos de miembros del servidor y vuelve a pulsar el botón."
+        ),
+        "daily": (
+            "🍪 **Recordatorio privado de votación: {title}**\n"
+            "[Ver las opciones y votar]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **¡Última hora para votar en {title}!**\n"
+            "[Ver las opciones y votar ahora]({url})\n"
+            "La votación termina <t:{closes}:R>."
+        ),
+    },
+    "pt": {
+        "enabled": (
+            "🔔 **Os lembretes privados estão ativados para {title}.**\n"
+            "Vou enviar uma mensagem no próximo lembrete de 24 horas e na última hora.\n"
+            "[Ver o concurso e votar]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+        "disabled": "🔕 Os lembretes privados estão desativados para **{title}**.",
+        "unavailable": (
+            "Não consegui enviar uma mensagem privada, então os lembretes não foram ativados. "
+            "Permita mensagens diretas de membros do servidor e toque no botão novamente."
+        ),
+        "daily": (
+            "🍪 **Lembrete privado de votação: {title}**\n"
+            "[Ver as opções e votar]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Última hora para votar em {title}!**\n"
+            "[Ver as opções e votar agora]({url})\n"
+            "A votação termina <t:{closes}:R>."
+        ),
+    },
+    "fr": {
+        "enabled": (
+            "🔔 **Les rappels privés sont activés pour {title}.**\n"
+            "Je vous écrirai lors du prochain rappel de 24 heures et pendant la dernière heure.\n"
+            "[Voir le concours et voter]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+        "disabled": "🔕 Les rappels privés sont désactivés pour **{title}**.",
+        "unavailable": (
+            "Je n’ai pas pu vous envoyer de message privé, donc les rappels n’ont pas été activés. "
+            "Autorisez les messages directs des membres du serveur, puis appuyez à nouveau sur le bouton."
+        ),
+        "daily": (
+            "🍪 **Rappel privé de vote : {title}**\n"
+            "[Voir les choix et voter]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Dernière heure pour voter : {title} !**\n"
+            "[Voir les choix et voter maintenant]({url})\n"
+            "Le vote se termine <t:{closes}:R>."
+        ),
+    },
+    "de": {
+        "enabled": (
+            "🔔 **Private Erinnerungen für {title} sind aktiviert.**\n"
+            "Ich schreibe dir bei der nächsten 24-Stunden-Erinnerung und in der letzten Stunde.\n"
+            "[Wettbewerb ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+        "disabled": "🔕 Private Erinnerungen für **{title}** sind deaktiviert.",
+        "unavailable": (
+            "Ich konnte dir keine Direktnachricht senden, daher wurden die Erinnerungen nicht aktiviert. "
+            "Erlaube Direktnachrichten von Servermitgliedern und tippe erneut auf die Schaltfläche."
+        ),
+        "daily": (
+            "🍪 **Private Abstimmungserinnerung: {title}**\n"
+            "[Beiträge ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **Letzte Stunde für die Abstimmung: {title}!**\n"
+            "[Jetzt ansehen und abstimmen]({url})\n"
+            "Die Abstimmung endet <t:{closes}:R>."
+        ),
+    },
+    "tr": {
+        "enabled": (
+            "🔔 **{title} için özel hatırlatmalar açıldı.**\n"
+            "Bir sonraki 24 saatlik hatırlatmada ve son saatte size mesaj göndereceğim.\n"
+            "[Yarışmayı görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+        "disabled": "🔕 **{title}** için özel hatırlatmalar kapatıldı.",
+        "unavailable": (
+            "Size özel mesaj gönderemedim, bu yüzden hatırlatmalar açılmadı. "
+            "Sunucu üyelerinden gelen doğrudan mesajlara izin verip düğmeye tekrar dokunun."
+        ),
+        "daily": (
+            "🍪 **Özel oylama hatırlatması: {title}**\n"
+            "[Seçenekleri görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+        "final": (
+            "⏰ **{title} için son bir saat!**\n"
+            "[Şimdi görüntüle ve oy ver]({url})\n"
+            "Oylama <t:{closes}:R> sona erecek."
+        ),
+    },
+    "ar": {
+        "enabled": (
+            "🔔 **تم تفعيل التذكيرات الخاصة لمسابقة {title}.**\n"
+            "سأرسل لك رسالة عند تذكير الـ24 ساعة التالي وخلال الساعة الأخيرة.\n"
+            "[عرض المسابقة والتصويت]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+        "disabled": "🔕 تم إيقاف التذكيرات الخاصة لمسابقة **{title}**.",
+        "unavailable": (
+            "تعذر إرسال رسالة خاصة إليك، لذلك لم يتم تفعيل التذكيرات. "
+            "اسمح بالرسائل الخاصة من أعضاء الخادم ثم اضغط على الزر مرة أخرى."
+        ),
+        "daily": (
+            "🍪 **تذكير خاص بالتصويت: {title}**\n"
+            "[عرض المشاركات والتصويت]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+        "final": (
+            "⏰ **الساعة الأخيرة للتصويت في {title}!**\n"
+            "[عرض المشاركات والتصويت الآن]({url})\n"
+            "ينتهي التصويت <t:{closes}:R>."
+        ),
+    },
+    "zh-CN": {
+        "enabled": (
+            "🔔 **已开启 {title} 的私信提醒。**\n"
+            "我会在下一次24小时提醒和最后一小时向你发送私信。\n"
+            "[查看比赛并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+        "disabled": "🔕 已关闭 **{title}** 的私信提醒。",
+        "unavailable": (
+            "我无法向你发送私信，因此没有开启提醒。请允许接收服务器成员的私信，然后再次点击按钮。"
+        ),
+        "daily": (
+            "🍪 **私信投票提醒：{title}**\n"
+            "[查看参赛作品并投票]({url})\n"
+            "投票将于 <t:{closes}:R> 结束。"
+        ),
+        "final": (
+            "⏰ **{title} 投票只剩最后一小时！**\n"
+            "[立即查看参赛作品并投票]({url})\n"
             "投票将于 <t:{closes}:R> 结束。"
         ),
     },
@@ -1989,6 +2215,34 @@ def contest_notice_text(
         CONTEST_NOTICE_TEMPLATES["en"],
     )
     template = templates.get(notice_kind, templates["daily"])
+    notice = template.format(
+        title=discord.utils.escape_markdown(contest.title),
+        url=url,
+        closes=closes,
+    )
+    private_prompt = CONTEST_PRIVATE_REMINDER_PROMPTS.get(
+        language,
+        CONTEST_PRIVATE_REMINDER_PROMPTS["en"],
+    )
+    return f"{notice}\n{private_prompt}"
+
+
+def contest_private_dm_text(
+    contest: ContestRecord,
+    language: str,
+    message_kind: str,
+) -> Optional[str]:
+    url = contest_jump_url(contest)
+    if url is None or contest.closes_at is None:
+        return None
+    closes = int(datetime.fromisoformat(contest.closes_at).timestamp())
+    templates = CONTEST_PRIVATE_DM_TEMPLATES.get(
+        language,
+        CONTEST_PRIVATE_DM_TEMPLATES["en"],
+    )
+    template = templates.get(message_kind)
+    if template is None:
+        return None
     return template.format(
         title=discord.utils.escape_markdown(contest.title),
         url=url,
@@ -2015,6 +2269,7 @@ async def broadcast_contest_notice(
         try:
             await channel.send(
                 notice,
+                view=ContestReminderView(contest.contest_id, language=language),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             sent_count += 1
@@ -2177,12 +2432,26 @@ def contest_gallery_embed(
     image_url: str,
     closes_at: Optional[datetime] = None,
     tallies: Optional[Sequence[ContestTally]] = None,
+    cancelled_reason: Optional[str] = None,
 ) -> discord.Embed:
     first_number = entries[0].entry_number
     last_number = entries[-1].entry_number
     title = f"🍪 {contest.title} — Entries #{first_number}–#{last_number}"
 
-    if tallies is not None:
+    if cancelled_reason is not None:
+        title = f"🚫 {contest.title} — Contest Canceled"
+        description = (
+            "This contest was ended by the organizers. Voting is disabled and "
+            "no winner, rankings, names, or vote totals were announced."
+        )
+        clean_reason = cancelled_reason.strip()
+        if clean_reason:
+            description += (
+                "\n\n**Reason:** "
+                + discord.utils.escape_markdown(clean_reason[:500])
+            )
+        color = discord.Color.red()
+    elif tallies is not None:
         lines = []
         for tally in sorted(tallies, key=lambda item: item.entry.entry_number):
             name = discord.utils.escape_markdown(tally.entry.contestant_name)
@@ -2197,7 +2466,8 @@ def contest_gallery_embed(
         if closes_at is None:
             description = (
                 "This is a private preview. The published contest will show "
-                "numbered vote buttons below this collage."
+                "numbered vote buttons and an optional private-reminder button "
+                "below this collage."
             )
         else:
             closes_timestamp = int(closes_at.timestamp())
@@ -2209,6 +2479,7 @@ def contest_gallery_embed(
             description = (
                 "Tap the collage to enlarge it, then tap the matching numbered "
                 "button below to vote. You may change your vote before closing.\n\n"
+                "Want CHiP to remind you in a DM? Tap **🔔 Private Reminders**.\n\n"
                 f"**Voting closes:** <t:{closes_timestamp}:F> "
                 f"(<t:{closes_timestamp}:R>)\n"
                 f"{anonymity_note}"
@@ -2335,6 +2606,135 @@ class ContestVoteButton(discord.ui.Button):
         await record_contest_vote(interaction, self.entry_id)
 
 
+async def toggle_contest_private_reminders(
+    interaction: discord.Interaction,
+    contest_id: int,
+) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Private contest reminders can be enabled only inside the CMON server.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.bot:
+        await interaction.response.send_message(
+            "Bots cannot subscribe to contest reminders.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    contest = await contest_store.get_contest(contest_id)
+    if (
+        contest is None
+        or contest.guild_id != interaction.guild.id
+        or contest.status != "open"
+    ):
+        await interaction.followup.send(
+            "This contest is no longer open, so private reminders are unavailable.",
+            ephemeral=True,
+        )
+        return
+
+    language = member_language(interaction.user)
+    try:
+        enabled = await contest_store.toggle_reminder_subscription(
+            contest_id,
+            interaction.user.id,
+        )
+    except ContestError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    templates = CONTEST_PRIVATE_DM_TEMPLATES.get(
+        language,
+        CONTEST_PRIVATE_DM_TEMPLATES["en"],
+    )
+    if not enabled:
+        await interaction.followup.send(
+            templates["disabled"].format(
+                title=discord.utils.escape_markdown(contest.title)
+            ),
+            ephemeral=True,
+        )
+        return
+
+    confirmation = contest_private_dm_text(contest, language, "enabled")
+    if confirmation is None:
+        await contest_store.remove_reminder_subscription(
+            contest_id,
+            interaction.user.id,
+        )
+        await interaction.followup.send(
+            "CHiP could not locate this contest's voting link.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await interaction.user.send(
+            confirmation,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await contest_store.remove_reminder_subscription(
+            contest_id,
+            interaction.user.id,
+        )
+        await interaction.followup.send(
+            templates["unavailable"],
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(confirmation, ephemeral=True)
+
+
+class ContestReminderButton(discord.ui.Button):
+    def __init__(
+        self,
+        contest_id: int,
+        *,
+        language: str = "en",
+        row: int = 0,
+        disabled: bool = False,
+    ):
+        self.contest_id = contest_id
+        label = CONTEST_REMINDER_BUTTON_LABELS.get(
+            language,
+            CONTEST_REMINDER_BUTTON_LABELS["en"],
+        )
+        super().__init__(
+            label=label,
+            emoji="🔔",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"chip_contest_reminders:{contest_id}",
+            row=row,
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await toggle_contest_private_reminders(interaction, self.contest_id)
+
+
+class ContestReminderView(discord.ui.View):
+    def __init__(
+        self,
+        contest_id: int,
+        *,
+        language: str = "en",
+        disabled: bool = False,
+    ):
+        super().__init__(timeout=None)
+        self.add_item(
+            ContestReminderButton(
+                contest_id,
+                language=language,
+                disabled=disabled,
+            )
+        )
+
+
 class ContestVoteView(discord.ui.View):
     """Legacy single-entry view retained for already-published contests."""
 
@@ -2372,19 +2772,207 @@ class ContestGalleryVoteView(discord.ui.View):
                     disabled=disabled,
                 )
             )
+        self.add_item(
+            ContestReminderButton(
+                entries[0].contest_id,
+                row=4,
+                disabled=disabled,
+            )
+        )
 
 
 async def restore_contest_vote_views() -> int:
     entries_by_message: Dict[int, List[ContestEntryRecord]] = {}
+    open_contest_ids = set()
     for entry_id, message_id in await contest_store.open_entry_message_ids():
         entry = await contest_store.get_entry(entry_id)
         if entry is not None:
             entries_by_message.setdefault(message_id, []).append(entry)
+            open_contest_ids.add(entry.contest_id)
 
     for message_id, entries in entries_by_message.items():
         entries.sort(key=lambda item: item.entry_number)
         bot.add_view(ContestGalleryVoteView(entries), message_id=message_id)
+    for contest_id in open_contest_ids:
+        # General-language announcements are not stored individually, so one
+        # global persistent view per open contest restores every matching button.
+        bot.add_view(ContestReminderView(contest_id))
     return len(entries_by_message)
+
+
+async def send_contest_private_reminders(
+    contest: ContestRecord,
+    reminder_kind: str,
+) -> int:
+    """DM opted-in members in their current role language."""
+
+    guild = bot.get_guild(contest.guild_id)
+    if guild is None:
+        return 0
+
+    sent_count = 0
+    subscriber_ids = await contest_store.list_reminder_subscribers(
+        contest.contest_id
+    )
+    for user_id in subscriber_ids:
+        current_contest = await contest_store.get_contest(contest.contest_id)
+        if current_contest is None or current_contest.status != "open":
+            break
+
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                await contest_store.remove_reminder_subscription(
+                    contest.contest_id,
+                    user_id,
+                )
+                continue
+            except (discord.Forbidden, discord.HTTPException):
+                log.exception(
+                    "Could not resolve contest reminder subscriber %s.",
+                    user_id,
+                )
+                continue
+
+        if member.bot:
+            await contest_store.remove_reminder_subscription(
+                contest.contest_id,
+                user_id,
+            )
+            continue
+
+        language = member_language(member)
+        notice = contest_private_dm_text(
+            current_contest,
+            language,
+            reminder_kind,
+        )
+        if notice is None:
+            continue
+        try:
+            await member.send(
+                notice,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            sent_count += 1
+        except discord.Forbidden:
+            # The member may have disabled DMs after opting in. Remove the
+            # subscription so CHiP does not keep attempting unwanted messages.
+            await contest_store.remove_reminder_subscription(
+                contest.contest_id,
+                user_id,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "Could not send a %s contest reminder DM to member %s.",
+                reminder_kind,
+                user_id,
+            )
+
+        # discord.py handles formal rate limits; this gentle pace also avoids
+        # generating a large burst of direct messages at once.
+        await asyncio.sleep(0.2)
+
+    return sent_count
+
+
+async def refresh_live_contest_gallery(
+    contest: ContestRecord,
+    entries: Sequence[ContestEntryRecord],
+    new_entry: ContestEntryRecord,
+) -> discord.Message:
+    if not contest.channel_id or not contest.closes_at:
+        raise ContestStateError("CHiP cannot locate the published contest gallery.")
+    channel = await get_text_channel(contest.channel_id)
+    if channel is None:
+        raise ContestStateError("CHiP cannot access the contest channel.")
+
+    batch_index = (new_entry.entry_number - 1) // CONTEST_ENTRIES_PER_POST
+    batches = contest_entry_batches(entries)
+    if batch_index >= len(batches):
+        raise ContestStateError("CHiP could not determine the new entry’s gallery.")
+    batch = batches[batch_index]
+    file = await asyncio.to_thread(contest_collage_file, contest, batch)
+    closes_at = datetime.fromisoformat(contest.closes_at)
+    embed = contest_gallery_embed(
+        contest,
+        batch,
+        image_url=f"attachment://{file.filename}",
+        closes_at=closes_at,
+    )
+    view = ContestGalleryVoteView(batch)
+    existing_message_id = next(
+        (entry.message_id for entry in batch if entry.message_id),
+        None,
+    )
+
+    if existing_message_id is not None:
+        await contest_store.set_entry_message(new_entry.entry_id, existing_message_id)
+        message = await channel.fetch_message(existing_message_id)
+        return await message.edit(
+            embed=embed,
+            attachments=[file],
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    gallery_message: Optional[discord.Message] = None
+    try:
+        gallery_message = await channel.send(
+            embed=embed,
+            file=file,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await contest_store.set_entry_message(new_entry.entry_id, gallery_message.id)
+        return gallery_message
+    except Exception:
+        if gallery_message is not None:
+            try:
+                await gallery_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        raise
+
+
+async def disable_cancelled_contest_galleries(
+    contest: ContestRecord,
+    reason: str,
+) -> None:
+    if not contest.channel_id:
+        return
+    channel = await get_text_channel(contest.channel_id)
+    if channel is None:
+        return
+    entries = await contest_store.list_entries(contest.contest_id)
+    entries_by_message: Dict[int, List[ContestEntryRecord]] = {}
+    for entry in entries:
+        if entry.message_id:
+            entries_by_message.setdefault(entry.message_id, []).append(entry)
+
+    for message_id, message_entries in entries_by_message.items():
+        message_entries.sort(key=lambda item: item.entry_number)
+        try:
+            message = await channel.fetch_message(message_id)
+            image_url = (
+                message.attachments[0].url
+                if message.attachments
+                else "https://cdn.discordapp.com/embed/avatars/0.png"
+            )
+            await message.edit(
+                embed=contest_gallery_embed(
+                    contest,
+                    message_entries,
+                    image_url=image_url,
+                    cancelled_reason=reason,
+                ),
+                view=ContestGalleryVoteView(message_entries, disabled=True),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            log.exception("Could not disable canceled contest post %s.", message_id)
 
 
 def contest_leaderboard_lines(tallies: Sequence[ContestTally]) -> List[str]:
@@ -2563,6 +3151,7 @@ async def contest_auto_close_loop() -> None:
     for contest, reminder_kind in await contest_store.claim_due_reminders(now_iso):
         try:
             await broadcast_contest_notice(contest, reminder_kind)
+            await send_contest_private_reminders(contest, reminder_kind)
         except Exception:
             log.exception(
                 "Automatic %s reminder failed for contest %s.",
@@ -2627,7 +3216,10 @@ async def contest_create_command(
     )
 
 
-@contest_group.command(name="add", description="Upload an approved image to the draft.")
+@contest_group.command(
+    name="add",
+    description="Add an approved image before or during live voting.",
+)
 @app_commands.describe(
     contestant_name="Name to reveal with this entry when the contest closes.",
     image="PNG, JPG, GIF, or WEBP contest image.",
@@ -2662,30 +3254,71 @@ async def contest_add_command(
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
+    entry: Optional[ContestEntryRecord] = None
+    contest: Optional[ContestRecord] = None
     try:
         image_data = await image.read(use_cached=True)
         if not image_data:
             raise ContestStateError("Discord returned an empty image file.")
-        entry = await contest_store.add_entry(
-            interaction.guild.id,
-            clean_name,
-            image.filename,
-            image.content_type or "application/octet-stream",
-            image_data,
-            interaction.user.id,
-        )
-    except (ContestError, discord.HTTPException) as error:
+        async with contest_action_lock:
+            contest = await contest_store.get_active_contest(interaction.guild.id)
+            if contest is None:
+                raise ContestStateError(
+                    "Create a contest before adding entries, or make sure voting "
+                    "is still open."
+                )
+            entry = await contest_store.add_entry(
+                interaction.guild.id,
+                clean_name,
+                image.filename,
+                image.content_type or "application/octet-stream",
+                image_data,
+                interaction.user.id,
+            )
+            if contest.status == "open":
+                try:
+                    entries = await contest_store.list_entries(
+                        contest.contest_id,
+                        include_image_data=True,
+                    )
+                    await refresh_live_contest_gallery(contest, entries, entry)
+                except Exception:
+                    await contest_store.delete_unvoted_entry(entry.entry_id)
+                    raise
+    except (ContestError, discord.Forbidden, discord.HTTPException) as error:
+        log.exception("Contest entry upload failed.")
         await interaction.followup.send(
             f"CHiP could not add that entry: {error}",
             ephemeral=True,
         )
         return
+    except Exception:
+        log.exception("Unexpected live contest gallery update failure.")
+        await interaction.followup.send(
+            "CHiP could not update the live gallery, so the new entry was not "
+            "saved. Please try again.",
+            ephemeral=True,
+        )
+        return
 
-    await interaction.followup.send(
-        f"✅ Added **{clean_name}** as **Entry #{entry.entry_number}**.\n"
-        "Keep using `/contest add`, then run `/contest preview`.",
-        ephemeral=True,
-    )
+    if entry is None or contest is None:
+        await interaction.followup.send(
+            "CHiP could not save that contest entry.",
+            ephemeral=True,
+        )
+        return
+
+    if contest.status == "open":
+        confirmation = (
+            f"✅ Added **{clean_name}** as **Entry #{entry.entry_number}** and "
+            "updated the live voting gallery. Existing votes were preserved."
+        )
+    else:
+        confirmation = (
+            f"✅ Added **{clean_name}** as **Entry #{entry.entry_number}**.\n"
+            "Keep using `/contest add`, then run `/contest preview`."
+        )
+    await interaction.followup.send(confirmation, ephemeral=True)
 
 
 @contest_group.command(name="remove", description="Remove and renumber a draft entry.")
@@ -2890,41 +3523,9 @@ async def contest_publish_command(
     await interaction.followup.send(
         f"✅ **{contest.title}** is live in {target_channel.mention}!\n"
         f"Voting closes <t:{int(closes_at.timestamp())}:R>.\n"
-        f"CHiP will remind every general-language chat every **{CONTEST_REMINDER_INTERVAL_HOURS} hours**, "
-        f"plus once more during the **final {CONTEST_FINAL_REMINDER_HOURS} hours**.",
-        ephemeral=True,
-    )
-
-
-@contest_group.command(
-    name="reminder",
-    description="Send an extra voting reminder to every general-language chat.",
-)
-@contest_manager_only()
-async def contest_reminder_command(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        raise ContestManagerRequired()
-
-    contest = await contest_store.get_active_contest(interaction.guild.id)
-    if contest is None or contest.status != "open":
-        await interaction.response.send_message(
-            "There is no open contest to remind members about.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    sent_count = await broadcast_contest_notice(contest, "daily")
-    if sent_count == 0:
-        await interaction.followup.send(
-            "CHiP could not send the reminder to any configured General language channel.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.followup.send(
-        f"🍪 Extra contest reminder sent to **{sent_count}** General language "
-        "channel(s). The automatic 24-hour timer was not changed.",
+        "CHiP will remind every general-language chat every **24 hours**, "
+        "plus once more during the **final hour**. Members can use the "
+        "**🔔 Private Reminders** button to opt into DMs in their language.",
         ephemeral=True,
     )
 
@@ -2943,6 +3544,9 @@ async def contest_status_command(interaction: discord.Interaction) -> None:
         return
     entries = await contest_store.list_entries(contest.contest_id)
     votes = await contest_store.vote_count(contest.contest_id)
+    reminder_subscribers = await contest_store.list_reminder_subscribers(
+        contest.contest_id
+    )
     status_text = "📝 Draft" if contest.status == "draft" else "🟢 Voting open"
     closes_text = (
         f"<t:{int(datetime.fromisoformat(contest.closes_at).timestamp())}:F>"
@@ -2959,8 +3563,9 @@ async def contest_status_command(interaction: discord.Interaction) -> None:
             f"**Status:** {status_text}\n"
             f"**Entries:** {len(entries)}\n"
             f"**Votes recorded:** {votes}\n"
+            f"**Private reminder opt-ins:** {len(reminder_subscribers)}\n"
             f"**Closes:** {closes_text}\n\n"
-            f"**Reminders:** Every {CONTEST_REMINDER_INTERVAL_HOURS} hours + final {CONTEST_FINAL_REMINDER_HOURS} hours\n\n"
+            "**Reminders:** Every 24 hours + final hour\n\n"
             f"{entry_lines}"
         ),
         color=discord.Color.blurple(),
@@ -2993,20 +3598,39 @@ async def contest_close_command(interaction: discord.Interaction) -> None:
     )
 
 
-@contest_group.command(name="cancel", description="Cancel the current unpublished draft.")
+@contest_group.command(
+    name="cancel",
+    description="Cancel a draft or live contest without announcing a winner.",
+)
+@app_commands.describe(reason="Optional reason shown on a canceled live contest.")
 @contest_manager_only()
-async def contest_cancel_command(interaction: discord.Interaction) -> None:
+async def contest_cancel_command(
+    interaction: discord.Interaction,
+    reason: str = "",
+) -> None:
     if interaction.guild is None:
         raise ContestManagerRequired()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    clean_reason = " ".join(reason.split())[:500]
     try:
-        contest = await contest_store.cancel_draft(interaction.guild.id)
+        async with contest_action_lock:
+            contest = await contest_store.cancel_active_contest(
+                interaction.guild.id
+            )
+            if contest.status == "open":
+                await disable_cancelled_contest_galleries(contest, clean_reason)
     except ContestError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction.followup.send(str(error), ephemeral=True)
         return
-    await interaction.response.send_message(
-        f"Cancelled the unpublished draft **{contest.title}**.",
-        ephemeral=True,
-    )
+
+    if contest.status == "open":
+        message = (
+            f"🚫 **{contest.title}** was canceled. Voting is disabled and no "
+            "winner, rankings, names, or vote totals were announced."
+        )
+    else:
+        message = f"Cancelled the unpublished draft **{contest.title}**."
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @contest_group.command(name="manager-add", description="Allow someone to manage contests.")
