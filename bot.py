@@ -3697,6 +3697,85 @@ async def contest_manager_list_command(interaction: discord.Interaction) -> None
     )
 
 
+# Owner-only announcements. These do not activate CHiP maintenance or server lockdown.
+@bot.tree.command(name="announcement", description="Preview or publish a CMON announcement in English, Spanish, and Portuguese.")
+@app_commands.describe(
+    message="Your announcement text in English (up to 1500 characters).",
+    title="Announcement heading (optional).",
+    publish="Set True to publish; False previews privately first.",
+)
+async def owner_announcement(
+    interaction: discord.Interaction,
+    message: str,
+    title: str = "CMON Announcement",
+    publish: bool = False,
+) -> None:
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "Only the CMON server owner can publish CHiP announcements.", ephemeral=True
+        )
+        return
+    message = message.strip()
+    title = title.strip()[:100] or "CMON Announcement"
+    if not message or len(message) > 1500:
+        await interaction.response.send_message(
+            "Please provide a message between 1 and 1500 characters.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        translations = await azure_translator.translate_many(message, "en", ["es", "pt"])
+    except TranslationError:
+        log.exception("Could not translate owner announcement.")
+        await interaction.followup.send(
+            "Translation failed, so nothing was published. Try again shortly.", ephemeral=True
+        )
+        return
+    embed = discord.Embed(title=f"📢 {title}", color=discord.Color.gold(),
+                          timestamp=datetime.now(timezone.utc))
+    for label, code in (("🇺🇸 English", "en"), ("🇪🇸 Español", "es"),
+                        ("🇧🇷 Português", "pt")):
+        body = message if code == "en" else translations.get(code)
+        if not body:
+            await interaction.followup.send(
+                "A translation was missing, so nothing was published.", ephemeral=True
+            )
+            return
+        if len(body) > 1024:
+            await interaction.followup.send(
+                "The translated announcement is too long for an embed field. "
+                "Please shorten the message.", ephemeral=True
+            )
+            return
+        embed.add_field(name=label, value=body, inline=False)
+    if not publish:
+        await interaction.followup.send(
+            "**PRIVATE PREVIEW — nothing has been posted.**\n"
+            "Run `/announcement` again with `publish: True` to send it.",
+            embed=embed, ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    channel = await get_text_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if channel is None or channel.guild.id != interaction.guild.id:
+        await interaction.followup.send(
+            "CHiP cannot find the configured announcement channel.", ephemeral=True
+        )
+        return
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Could not publish owner announcement.")
+        await interaction.followup.send(
+            "Posting failed. Check CHiP's channel permissions.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"Announcement published in {channel.mention} in all three languages.",
+        ephemeral=True,
+    )
+
+
 maintenance_group = app_commands.Group(
     name="maintenance",
     description="Control CHiP maintenance mode.",
