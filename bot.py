@@ -4281,6 +4281,9 @@ async def terra_resume_command(interaction: discord.Interaction) -> None:
     )
 
 
+from chip_lockdown import register as register_lockdown
+register_lockdown(bot, ANNOUNCEMENT_CHANNEL_ID, DATA_DIR)
+
 bot.tree.add_command(contest_group)
 bot.tree.add_command(maintenance_group)
 bot.tree.add_command(chip_group)

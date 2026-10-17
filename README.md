@@ -228,3 +228,12 @@ The dedicated member-chat channel only needs **View Channel**, **Send Messages**
 7. Run `/contest manager-add member:@MsMax`, create a two-image test contest,
    vote, and close it.
 8. Check Railway logs for Azure, Terra, and Luna all reporting configured.
+
+
+## Server redesign lockdown (separate from bot maintenance)
+
+Owner-only commands: `/lockdown status`, `/lockdown start`, `/lockdown end`.
+`/lockdown start` and `/lockdown end` default to preview-only; specify `confirm:true` to apply.
+The start command saves original channel/category permission overwrites, sync state, and names in a persistent JSON backup under `CHIP_DATA_DIR`, then hides every channel except the CHiP announcement channel (renamed `🔧server-maintenance`, read-only). End restores all saved state.
+**Prerequisites:** Railway persistent volume mounted at `/data`, `CHIP_DATA_DIR=/data`, CHiP Administrator permission, and no other Administrator roles accessible to other members. Administrator bypasses channel overrides; review all roles, including any role shared with CHiP. Do not remove the Railway volume while locked.
+**Caution:** This feature has not been live-tested on your Discord server. Test on a separate test server first. Channel/role additions and permission changes made while locked may not be restored. If a restore fails, the backup is retained; rerun end or restore manually from JSON. Existing `/maintenance` commands remain unchanged.
