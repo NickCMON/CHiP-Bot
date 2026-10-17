@@ -93,6 +93,43 @@ def _channel_lock_overwrites(guild, channel, announcement):
     return ow
 
 
+
+def _three_way_overwrites(guild, original_entry, locked_entry, current_channel):
+    """Undo only lockdown's permission values that are still unchanged.
+
+    Any permission changed since lockdown, new role/member overwrite, and
+    unrelated permission bit remains untouched. No category re-sync.
+    """
+    current = dict(current_channel.overwrites)
+    original = _restore_overwrites(guild, original_entry)
+    locked = _restore_overwrites(guild, locked_entry)
+    for target in set(original) | set(locked):
+        old_ow = original.get(target, discord.PermissionOverwrite())
+        lock_ow = locked.get(target, discord.PermissionOverwrite())
+        now_ow = current.get(target, discord.PermissionOverwrite())
+        changed = False
+        for perm, lock_value in lock_ow:
+            old_value = getattr(old_ow, perm)
+            now_value = getattr(now_ow, perm)
+            if old_value != lock_value and now_value == lock_value:
+                setattr(now_ow, perm, old_value)
+                changed = True
+        if changed:
+            if now_ow.is_empty():
+                current.pop(target, None)
+            else:
+                current[target] = now_ow
+    return current
+
+
+def _locked_snapshot(guild, channels, announcement_id):
+    return [{"id": c.id, "overwrites": [
+        {"id": target.id, "kind": "role" if isinstance(target, discord.Role) else "member",
+         "allow": ow.pair()[0].value, "deny": ow.pair()[1].value}
+        for target, ow in _channel_lock_overwrites(guild, c, c.id == announcement_id).items()
+    ]} for c in channels]
+
+
 async def _owner(interaction):
     return interaction.guild is not None and interaction.user.id == interaction.guild.owner_id
 
@@ -154,7 +191,7 @@ def register(bot, announcement_id: int, data_dir: Path):
         if not path.exists():
             return await _reply(interaction, "🔓 No saved lockdown is active. Server permissions have not been changed by /lockdown.")
         snap = _load_backup(path)
-        await _reply(interaction, f"🔒 Lockdown backup exists ({snap['started_at']}). {len(snap['channels'])} channels saved. Use /lockdown end confirm:true to restore.")
+        await _reply(interaction, f"🔒 Lockdown backup exists ({snap['started_at']}). {len(snap['channels'])} channels saved. Use /lockdown end confirm:true to lift the temporary restrictions while preserving redesign edits.")
 
     @lockdown_group.command(name="start", description="Hide all channels except the read-only maintenance channel")
     @app_commands.describe(confirm="Set true to apply the lockdown after reading the preview")
@@ -170,10 +207,10 @@ def register(bot, announcement_id: int, data_dir: Path):
             if error:
                 return await _reply(interaction, "⚠️ Lockdown NOT started. " + error)
             if not confirm:
-                return await _reply(interaction, f"PREVIEW ONLY — no changes made. Lockdown will hide {len(guild.channels)-1} channels from members, keep CHiP Announcements visible and read-only as 🔧server-maintenance, and save original permissions for restoration. Existing /maintenance commands are separate. Run /lockdown start confirm:true to proceed. IMPORTANT: Keep a separate backup of your server permissions and verify CHiP's Railway /data volume first.")
+                return await _reply(interaction, f"PREVIEW ONLY — no changes made. Lockdown will hide {len(guild.channels)-1} channels from members, keep CHiP Announcements visible and read-only as 🔧server-maintenance, and save a safety snapshot and temporary lockdown changes for selective unlocking. Existing /maintenance commands are separate. Run /lockdown start confirm:true to proceed. IMPORTANT: Keep a separate backup of your server permissions and verify CHiP's Railway /data volume first.")
             await interaction.response.defer(ephemeral=True, thinking=True)
             channels = list(guild.channels)
-            snapshot = {"version": 1, "guild_id": guild.id, "started_at": datetime.now(timezone.utc).isoformat(), "announcement_id": announcement_id, "channels": [_snapshot_channel(c) for c in channels]}
+            snapshot = {"version": 2, "guild_id": guild.id, "started_at": datetime.now(timezone.utc).isoformat(), "announcement_id": announcement_id, "channels": [_snapshot_channel(c) for c in channels], "locked_channels": _locked_snapshot(guild, channels, announcement_id)}
             try:
                 _save_backup(path, snapshot)
             except OSError as exc:
@@ -188,11 +225,11 @@ def register(bot, announcement_id: int, data_dir: Path):
                 await announcement.edit(name="🔧server-maintenance", reason="CMON temporary server lockdown")
             except Exception as exc:
                 log.exception("Lockdown partially applied; backup retained for /lockdown end")
-                return await _reply(interaction, f"⚠️ Lockdown partially applied ({len(changed)}/{len(channels)} channels): {type(exc).__name__}. Backup is saved. Run /lockdown end confirm:true to restore immediately. Do not delete the /data volume.")
-            await _reply(interaction, f"🔒 Lockdown applied to {len(channels)} channels. Only the server owner and Discord Administrators can bypass the hidden-channel restrictions. Announcement channel is read-only for members. Use /lockdown end confirm:true to restore.")
+                return await _reply(interaction, f"⚠️ Lockdown partially applied ({len(changed)}/{len(channels)} channels): {type(exc).__name__}. Backup is saved. Run /lockdown end confirm:true to attempt selective unlock. Do not delete the /data volume.")
+            await _reply(interaction, f"🔒 Lockdown applied to {len(channels)} channels. Only the server owner and Discord Administrators can bypass the hidden-channel restrictions. Announcement channel is read-only for members. Use /lockdown end confirm:true to lift the temporary restrictions while preserving redesign edits.")
 
-    @lockdown_group.command(name="end", description="Restore saved channel permissions and announcement name")
-    @app_commands.describe(confirm="Set true to restore all original channel permissions")
+    @lockdown_group.command(name="end", description="Lift temporary lockdown without reverting redesign edits")
+    @app_commands.describe(confirm="Set true to lift lockdown while preserving redesign changes")
     async def end(interaction: discord.Interaction, confirm: bool = False):
         if not await _owner(interaction):
             return await _reply(interaction, "Only the server owner can end lockdown.")
@@ -204,30 +241,41 @@ def register(bot, announcement_id: int, data_dir: Path):
             snap = _load_backup(path)
             if snap.get('guild_id') != guild.id:
                 return await _reply(interaction, "Backup guild ID does not match. No changes made.")
+            if snap.get("version") != 2 or "locked_channels" not in snap:
+                return await _reply(interaction, "This backup predates redesign-safe lockdown. Refusing to overwrite edits. Ask for help with migration.")
             if not confirm:
-                return await _reply(interaction, f"PREVIEW ONLY — restore permissions and original names for {len(snap['channels'])} channels. Run /lockdown end confirm:true to restore.")
+                return await _reply(interaction, f"PREVIEW ONLY — selectively lift lockdown for {len(snap['channels'])} original channels, keeping channel names, categories, role assignments and permission edits. New channels are not changed. Run /lockdown end confirm:true to proceed. IMPORTANT: Permissions still equal to lockdown values will be treated as temporary restrictions.")
             await interaction.response.defer(ephemeral=True, thinking=True)
             failures = []
-            # Restore categories first, then children. Preserve sync state.
-            ordered = sorted(snap['channels'], key=lambda e: 0 if isinstance(guild.get_channel(e['id']), discord.CategoryChannel) else 1)
-            for entry in ordered:
+            unlocked = 0
+            locked_map = {e['id']: e for e in snap['locked_channels']}
+            for entry in snap['channels']:
                 channel = guild.get_channel(entry['id'])
                 if channel is None:
-                    failures.append(f"missing channel {entry['id']}")
-                    continue
+                    continue  # User intentionally deleted this channel.
                 try:
-                    original = _restore_overwrites(guild, entry)
-                    await channel.edit(overwrites=original, reason="CMON restore pre-lockdown channel permissions")
-                    if channel.name != entry['name']:
-                        await channel.edit(name=entry['name'], reason="CMON restore original channel name")
-                    if entry['synced'] and getattr(channel, 'category', None) is not None:
-                        await channel.edit(sync_permissions=True, reason="CMON restore category permission sync")
+                    locked = locked_map[entry['id']]
+                    merged = _three_way_overwrites(guild, entry, locked, channel)
+                    if merged != channel.overwrites:
+                        await channel.edit(overwrites=merged, reason="CMON lift temporary lockdown, preserve redesign edits")
+                    unlocked += 1
                 except Exception as exc:
                     failures.append(f"{entry['id']}: {type(exc).__name__}")
-                    log.exception("Failed restoring channel %s", entry['id'])
+                    log.exception("Failed selectively unlocking channel %s", entry['id'])
+            announcement = guild.get_channel(snap['announcement_id'])
+            if announcement is not None and announcement.name == "🔧server-maintenance":
+                try:
+                    original_announcement = next((c for c in snap['channels'] if c['id'] == snap['announcement_id']), None)
+                    if original_announcement:
+                        await announcement.edit(name=original_announcement['name'], reason="CMON end temporary maintenance channel name")
+                except Exception as exc:
+                    failures.append(f"announcement rename: {type(exc).__name__}")
             if failures:
-                return await _reply(interaction, f"⚠️ Restore incomplete. Backup kept so you can retry. {len(failures)} errors: " + ', '.join(failures[:8]))
-            path.unlink()
-            await _reply(interaction, f"🔓 Restored {len(ordered)} channels, their permissions, original names, and category sync. Lockdown backup cleared.")
+                return await _reply(interaction, f"⚠️ Selective unlock incomplete. Backup kept so you can retry. {len(failures)} errors: " + ', '.join(failures[:8]))
+            try:
+                path.unlink()
+            except OSError as exc:
+                return await _reply(interaction, f"Permissions unlocked but backup could not be cleared: {exc}. Do not start another lockdown yet.")
+            await _reply(interaction, f"🔓 Lockdown lifted for {unlocked} surviving original channels. Redesign changes preserved where distinguishable from lockdown overrides. New channels and deleted channels untouched. Check member-view permissions before announcing reopening.")
 
     bot.tree.add_command(lockdown_group)
