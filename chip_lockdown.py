@@ -111,13 +111,31 @@ async def _preflight(interaction, announcement_id, data_dir):
         return "The configured CHiP announcement channel is missing or is not a text channel."
     if not guild.me or not guild.me.guild_permissions.administrator:
         return "CHiP needs Administrator permission to safely manage and recover all channel overrides."
-    admin_roles = [role.name for role in guild.roles if role.permissions.administrator and role not in guild.me.roles]
-    if admin_roles:
-        return "Other Administrator roles bypass channel lockdown: " + ', '.join(admin_roles[:12]) + ". Disable their Administrator permission first."
-    # A role with Administrator shared by another member is also unsafe.
-    for role in guild.me.roles:
-        if role.permissions.administrator and any(member.id != guild.me.id for member in role.members):
-            return f"CHiP's Administrator role ({role.name}) is shared with other members. Give CHiP a private admin role first."
+    # Discord Administrator bypasses channel overwrites regardless of role order.
+    # Bot-only Administrator roles are explicitly allowed, but no human member
+    # (other than the guild owner) may retain Administrator during lockdown.
+    if not guild.chunked:
+        try:
+            await guild.chunk(cache=True)
+        except (discord.HTTPException, discord.ClientException):
+            return "Could not verify all server members' Administrator roles. Lockdown cancelled."
+    unsafe_roles = []
+    for role in guild.roles:
+        if not role.permissions.administrator:
+            continue
+        non_owner_humans = [
+            member for member in role.members
+            if not member.bot and member.id != guild.owner_id
+        ]
+        if non_owner_humans:
+            unsafe_roles.append(role.name)
+    if unsafe_roles:
+        return (
+            "Human members have Administrator roles that bypass lockdown: "
+            + ", ".join(unsafe_roles[:12])
+            + ". Remove Administrator from those roles or members first. "
+            "Bot-only Administrator roles (such as MEE6) are allowed."
+        )
     if not data_dir.is_dir() or not os.access(data_dir, os.W_OK):
         return "CHiP's persistent data directory is not writable. Check Railway's /data volume."
     if str(data_dir.resolve()) == str(Path(__file__).resolve().parent):
