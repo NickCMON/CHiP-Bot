@@ -1,6 +1,6 @@
 # CHiP Bot
 
-CHiP is CMON's Discord translation, member-chat, contest, and role bot. This
+CHiP is CMON's Discord translation, announcements, member-chat, and role bot. This
 build replaces the unofficial Google translation endpoint that occasionally
 posted an HTML `Error 500` page into Discord.
 
@@ -15,6 +15,15 @@ posted an HTML `Error 500` page into Discord.
 - If Azure has an API error, CHiP relays the original human message and records
   the error privately. Provider error pages are never posted into chat.
 - Media-only messages never call either paid translation service.
+
+Translation channels are isolated by group: general-language chat, private R4
+chat, and optional SvS channels. After creating SvS channels in Discord, set
+`SVS_ENGLISH_CHANNEL_ID`, `SVS_SPANISH_CHANNEL_ID`, and
+`SVS_PORTUGUESE_CHANNEL_ID` in CHiP's Railway Variables. Any unset IDs are
+ignored; for two-way SvS translation set at least two IDs. Restart/redeploy
+CHiP after updating variables. Ensure CHiP has View Channel, Send Messages,
+Manage Webhooks, and Attach Files in each channel. SvS messages never mirror
+to general or R4 channels.
 
 Official setup references:
 
@@ -61,8 +70,8 @@ CHIP_DATA_DIR=/data
 
 Without a volume, Railway can erase the SQLite usage database during a new
 deployment. With the volume, message links, maintenance state, combined AI
-usage, each member's ten most recent CHiP conversation messages, contest drafts,
-uploaded contest images, managers, votes, and the local budget setting survive
+usage, each member's ten most recent CHiP conversation messages, archived
+legacy CHiP contest data, and the local budget setting survive
 restarts and deployments.
 
 ## Admin slash commands
@@ -90,9 +99,10 @@ announcement channel.
 - `/chip channel-off` — disables the dedicated chat channel while leaving
   `/chip chat` and direct @mentions available.
 - `/chip pause` and `/chip resume` — control only member chat; translations and
-  contests remain available.
+  announcements remain available.
 
-All of these slash commands require the Discord **Administrator** permission.
+These admin groups require the Discord **Administrator** permission. The
+`/announcement` command below is restricted to the Discord server owner.
 
 ## Member conversations with CHiP
 
@@ -123,69 +133,37 @@ falls back to Azure. Maintenance mode pauses chat together with translation.
 The normal member commands `/chip chat` and `/chip reset` do **not** require
 Administrator permission.
 
-## Recurring image contests
+## Owner announcements with optional images
 
-CHiP can stage approved profile pictures and combine up to 20 entries into each
-high-resolution numbered collage. Every gallery post has matching numbered vote
-buttons (five per row). Totals stay hidden, each member has one changeable vote,
-and CHiP closes automatically, reveals the names, and announces the winner or
-tied winners. Contests above 20 entries continue in a second gallery post. The
-contest system never calls Azure or Terra.
+Use `/announcement` for a single multilingual embed in CHiP's configured
+announcement channel. Text is translated into English, Spanish, and Portuguese.
+The command accepts:
 
-When voting opens, CHiP posts a localized announcement with a direct contest
-link in every configured general-language channel. It then sends a reminder
-every 24 hours and one final reminder during the last hour. The reminders do not
-ping `@everyone` and do not use Azure, Terra, or Luna.
+- `message` — required English announcement (maximum 1,500 characters;
+  translated embed fields must each fit Discord's 1,024-character limit).
+- `title` — optional heading.
+- `image` — optional PNG, JPG, GIF, or WebP image attached directly in Discord.
+  CHiP uploads the image with the finished embed, rather than relying on an
+  expiring URL. Default maximum 10 MB, configurable with
+  `MAX_ANNOUNCEMENT_IMAGE_MB` in Railway.
+- `publish` — `false` privately previews the message and image (default);
+  `true` publishes. Attach the image again when running the publishing command.
 
-Every contest gallery and localized announcement also includes a
-**🔔 Private Reminders** button. Members must opt in themselves. CHiP first sends
-an immediate confirmation DM, then privately sends the 24-hour and final-hour
-reminders in the language from that member's current language role. English is
-used when no language role is selected. Tapping the button again turns private
-reminders off. If Discord blocks the confirmation DM, CHiP does not subscribe
-the member. Closing or canceling the contest deletes all remaining opt-ins.
+For a Den voting graphic, enter the officer's voting text, select the graphic
+under `image`, preview with `publish:false`, then run it again with
+`publish:true`. Announcements without images work exactly as before.
 
-The Discord server owner is always a contest manager. The owner should run this
-once to authorize MsMax:
+## Event ownership: BiSCUiT
 
-```text
-/contest manager-add member:@MsMax
-```
+BiSCUiT is the **only** bot that hosts PFP contests and other managed
+competition events. CHiP's former `/contest` command group is no longer
+registered, and CHiP does not restore old voting buttons, send event reminders,
+or automatically close and announce old contests.
 
-Normal contest workflow:
-
-1. `/contest create title:<title> duration_hours:<hours> anonymous:true`
-2. Run `/contest add contestant_name:<name> image:<attachment>` for every
-   approved image received by Nick or JC.
-3. `/contest preview` privately displays the same compact collages members will
-   see.
-4. `/contest publish channel:<contest-channel>` posts each 20-entry collage with
-   its matching numbered buttons, opens voting, and announces it in every
-   general-language channel.
-5. CHiP closes automatically at the deadline, or a manager can run
-   `/contest close` early.
-
-If someone was missed after publication, run `/contest add` normally while the
-contest is still open. CHiP automatically rebuilds the affected collage (or
-starts the next 20-entry post), adds the new numbered button, and preserves all
-existing votes.
-
-Additional management commands:
-
-- `/contest remove entry_number:<number>` — removes an entry from a draft and
-  renumbers the remaining images.
-- `/contest status` — privately shows entries, vote participation, and closing
-  time without exposing who is winning.
-- `/contest cancel reason:<optional>` — discards a draft or ends a live contest
-  without announcing any winner, rankings, names, or vote totals. Live gallery
-  buttons are disabled and reminders stop immediately.
-- `/contest manager-list` and `/contest manager-remove` — owner-only manager
-  controls.
-
-Only the server owner and saved contest managers can use contest-management
-commands. Regular members do not submit anything to CHiP; they only press a
-numbered Vote button. Uploaded contest images default to a 10 MB maximum, configurable
-with `MAX_CONTEST_IMAGE_MB`.
+Legacy CHiP contest records are deliberately **not deleted** from the existing
+SQLite database. Before migrating any unfinished CHiP-run contest, close or
+cancel it through the original deployment, or begin a fresh contest under
+BiSCUiT. Do not assume old CHiP votes automatically transfer to BiSCUiT.
 
 ## Emoji, sticker, GIF, and attachment relay
 
@@ -209,9 +187,6 @@ CHiP needs these permissions in every translation and announcement channel:
 - Attach Files
 - Embed Links
 
-The contest channel additionally needs **Read Message History** so CHiP can
-disable old buttons and reveal results when voting closes.
-
 The dedicated member-chat channel only needs **View Channel**, **Send Messages**,
 **Read Message History**, and **Embed Links**.
 
@@ -225,9 +200,12 @@ The dedicated member-chat channel only needs **View Channel**, **Send Messages**
    `/chip chat`, a follow-up question, and `/chip reset`.
 6. Test a Spanish slang message, a custom animated emoji, a sticker, a GIF link,
    and an uploaded image in a translation channel.
-7. Run `/contest manager-add member:@MsMax`, create a two-image test contest,
-   vote, and close it.
-8. Check Railway logs for Azure, Terra, and Luna all reporting configured.
+7. Preview `/announcement` with and without an image, then publish an image
+   to the announcement channel. Verify all three languages and the image.
+8. Verify CHiP no longer offers `/contest`, and use BiSCUiT for PFP contests.
+9. With the SvS channel IDs configured, send a test message in SvS English and
+   check Spanish and Portuguese receive only their SvS copies.
+10. Check Railway logs for Azure, Terra, and Luna all reporting configured.
 
 
 ## Server redesign lockdown (separate from bot maintenance)
