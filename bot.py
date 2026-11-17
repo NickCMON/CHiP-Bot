@@ -116,6 +116,10 @@ MAX_RELAY_FILE_BYTES = max(env_int("MAX_RELAY_FILE_MB", 20), 1) * 1024 * 1024
 MAX_CONTEST_IMAGE_BYTES = (
     max(env_int("MAX_CONTEST_IMAGE_MB", 10), 1) * 1024 * 1024
 )
+MAX_ANNOUNCEMENT_IMAGE_BYTES = (
+    max(env_int("MAX_ANNOUNCEMENT_IMAGE_MB", 10), 1) * 1024 * 1024
+)
+ANNOUNCEMENT_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 GENERAL_CHANNELS: Dict[int, str] = {
     env_int("ENGLISH_CHANNEL_ID"): "en",
@@ -139,10 +143,24 @@ R4_CHANNELS: Dict[int, str] = {
     1529548928218042458: "es",  # Spanish R4 Cookies chat
 }
 
+# Optional SvS language channels. Configure their IDs in Railway after creating
+# them in Discord. SvS messages are relayed only within this group.
+SVS_CHANNELS: Dict[int, str] = {
+    env_int("SVS_ENGLISH_CHANNEL_ID"): "en",
+    env_int("SVS_SPANISH_CHANNEL_ID"): "es",
+    env_int("SVS_PORTUGUESE_CHANNEL_ID"): "pt",
+}
+SVS_CHANNELS = {
+    channel_id: language
+    for channel_id, language in SVS_CHANNELS.items()
+    if channel_id
+}
+
 # Each message is translated only to channels inside its own group.
 TRANSLATION_GROUPS = {
     "general": GENERAL_CHANNELS,
     "r4_officers": R4_CHANNELS,
+    "svs": SVS_CHANNELS,
 }
 
 LANGUAGE_NAMES = {
@@ -3703,12 +3721,14 @@ async def contest_manager_list_command(interaction: discord.Interaction) -> None
     message="Your announcement text in English (up to 1500 characters).",
     title="Announcement heading (optional).",
     publish="Set True to publish; False previews privately first.",
+    image="Optional PNG, JPEG, GIF, or WebP graphic to show below the announcement.",
 )
 async def owner_announcement(
     interaction: discord.Interaction,
     message: str,
     title: str = "CMON Announcement",
     publish: bool = False,
+    image: Optional[discord.Attachment] = None,
 ) -> None:
     if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message(
@@ -3722,7 +3742,46 @@ async def owner_announcement(
             "Please provide a message between 1 and 1500 characters.", ephemeral=True
         )
         return
+    # Read and validate the optional image once, then re-upload it with the
+    # Discord embed. This avoids depending on expiring slash-command URLs.
+    image_bytes: Optional[bytes] = None
+    image_filename: Optional[str] = None
+    if image is not None:
+        extension = Path(image.filename).suffix.lower()
+        if (
+            extension not in ANNOUNCEMENT_IMAGE_EXTENSIONS
+            or (image.content_type and not image.content_type.startswith("image/"))
+        ):
+            await interaction.response.send_message(
+                "Please attach a PNG, JPG, GIF, or WebP image.", ephemeral=True
+            )
+            return
+        if image.size > MAX_ANNOUNCEMENT_IMAGE_BYTES:
+            await interaction.response.send_message(
+                f"That image is too large. Maximum: "
+                f"{MAX_ANNOUNCEMENT_IMAGE_BYTES // (1024 * 1024)} MB.",
+                ephemeral=True,
+            )
+            return
+
     await interaction.response.defer(ephemeral=True, thinking=True)
+    if image is not None:
+        try:
+            image_bytes = await image.read()
+        except (discord.HTTPException, OSError):
+            log.exception("Could not download the announcement image.")
+            await interaction.followup.send(
+                "CHiP could not read that image. Try attaching it again.", ephemeral=True
+            )
+            return
+        if not image_bytes or len(image_bytes) > MAX_ANNOUNCEMENT_IMAGE_BYTES:
+            await interaction.followup.send(
+                "The image was empty or exceeded the configured size limit.",
+                ephemeral=True,
+            )
+            return
+        image_filename = f"chip-announcement{extension}"
+
     try:
         translations = await azure_translator.translate_many(message, "en", ["es", "pt"])
     except TranslationError:
@@ -3748,11 +3807,24 @@ async def owner_announcement(
             )
             return
         embed.add_field(name=label, value=body, inline=False)
+    if image_filename is not None:
+        embed.set_image(url=f"attachment://{image_filename}")
+
+    def attached_image_file() -> Optional[discord.File]:
+        if image_bytes is None or image_filename is None:
+            return None
+        return discord.File(io.BytesIO(image_bytes), filename=image_filename)
+
     if not publish:
-        await interaction.followup.send(
+        preview_text = (
             "**PRIVATE PREVIEW — nothing has been posted.**\n"
-            "Run `/announcement` again with `publish: True` to send it.",
-            embed=embed, ephemeral=True,
+            "Run `/announcement` again with `publish: True` to send it."
+        )
+        if image_bytes is not None:
+            preview_text += " Attach the image again when publishing."
+        await interaction.followup.send(
+            preview_text,
+            embed=embed, file=attached_image_file(), ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
@@ -3763,7 +3835,10 @@ async def owner_announcement(
         )
         return
     try:
-        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(
+            embed=embed, file=attached_image_file(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     except (discord.Forbidden, discord.HTTPException):
         log.exception("Could not publish owner announcement.")
         await interaction.followup.send(
@@ -4284,7 +4359,8 @@ async def terra_resume_command(interaction: discord.Interaction) -> None:
 from chip_lockdown import register as register_lockdown
 register_lockdown(bot, ANNOUNCEMENT_CHANNEL_ID, DATA_DIR)
 
-bot.tree.add_command(contest_group)
+# CHiP no longer registers /contest: BiSCUiT is the sole event host.
+# Legacy contest code and saved records remain for safe historical retention.
 bot.tree.add_command(maintenance_group)
 bot.tree.add_command(chip_group)
 bot.tree.add_command(terra_group)
@@ -4352,13 +4428,8 @@ async def on_ready():
         bot.add_view(CookieColorView())
         bot.cookie_color_view_added = True
 
-    if not getattr(bot, "contest_views_added", False):
-        restored_views = await restore_contest_vote_views()
-        bot.contest_views_added = True
-        log.info("Restored %s active contest vote buttons.", restored_views)
-
-    if not contest_auto_close_loop.is_running():
-        contest_auto_close_loop.start()
+    # BiSCUiT handles contest voting, reminders, and winner announcements.
+    # Do not restore CHiP contest buttons or run its legacy auto-close loop.
 
     maintenance_active, _, _ = await maintenance_state()
     if maintenance_active:
