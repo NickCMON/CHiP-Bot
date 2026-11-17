@@ -3816,10 +3816,14 @@ async def owner_announcement(
         return discord.File(io.BytesIO(image_bytes), filename=image_filename)
 
     if not publish:
-        await interaction.followup.send(
+        preview_text = (
             "**PRIVATE PREVIEW — nothing has been posted.**\n"
             "Run `/announcement` again with `publish: True` to send it."
-            " Attach the image again when publishing.",
+        )
+        if image_bytes is not None:
+            preview_text += " Attach the image again when publishing."
+        await interaction.followup.send(
+            preview_text,
             embed=embed, file=attached_image_file(), ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -4355,7 +4359,7 @@ async def terra_resume_command(interaction: discord.Interaction) -> None:
 from chip_lockdown import register as register_lockdown
 register_lockdown(bot, ANNOUNCEMENT_CHANNEL_ID, DATA_DIR)
 
- # CHiP no longer registers /contest: BiSCUiT is the sole event host.
+# CHiP no longer registers /contest: BiSCUiT is the sole event host.
 # Legacy contest code and saved records remain for safe historical retention.
 bot.tree.add_command(maintenance_group)
 bot.tree.add_command(chip_group)
